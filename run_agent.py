@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+run_agent.py - Main entry point for MemCraft agent.
+
+Usage:
+    python run_agent.py --task "mine 5 dirt" --agent memagent
+    python run_agent.py --task "mine 5 dirt" --agent no_memory
+    python run_agent.py --task "mine 5 dirt" --agent naive_memory
+
+    # Compare all three agents:
+    python run_agent.py --task "mine 5 dirt" --agent compare
+"""
+
+import argparse
+import json
+import logging
+import os
+import requests
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from agent.brain import Brain
+from agent.agent import NoMemoryAgent, NaiveMemoryAgent, MemAgent
+
+
+def setup_logging(debug: bool = False):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def start_mineflayer_bridge(host: str, port: int, username: str,
+                             version: str, http_port: int) -> subprocess.Popen:
+    """Start the Node.js Mineflayer bridge."""
+    bridge_dir = Path(__file__).parent / "mineflayer_bridge"
+
+    # Check if node_modules exists
+    if not (bridge_dir / "node_modules").exists():
+        logging.info("Installing Mineflayer dependencies...")
+        subprocess.run(["npm", "install"], cwd=bridge_dir, check=True)
+
+    cmd = [
+        "node", "bot.js",
+        f"--host={host}",
+        f"--port={port}",
+        f"--username={username}",
+        f"--version={version}",
+        f"--http_port={http_port}",
+    ]
+    logging.info(f"Starting Mineflayer bridge: {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd, cwd=bridge_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    return proc
+
+
+def run_single_agent(agent_type: str, brain: Brain, goal: str,
+                     bot_url: str, max_steps: int, config: dict) -> dict:
+    """Run a single agent variant."""
+    if agent_type == "no_memory":
+        agent = NoMemoryAgent(brain, bot_url=bot_url, max_steps=max_steps)
+    elif agent_type == "naive_memory":
+        agent = NaiveMemoryAgent(brain, bot_url=bot_url, max_steps=max_steps,
+                                  history_length=10)
+    elif agent_type == "memagent":
+        agent = MemAgent(brain, bot_url=bot_url, max_steps=max_steps,
+                         config=config)
+    else:
+        raise ValueError(f"Unknown agent type: {agent_type}")
+
+    if agent_type == "memagent":
+        return agent.run(goal, persist_memory="memories/semantic_rules.json")
+    else:
+        return agent.run(goal)
+
+
+def print_results(results: dict):
+    """Pretty-print run results."""
+    print("\n" + "=" * 60)
+    print(f"Agent: {results['agent_type']}")
+    print(f"Goal: {results['goal']}")
+    print(f"Success: {'✓ YES' if results['success'] else '✗ NO'}")
+    print(f"Total Steps: {results['total_steps']}")
+
+    stats = results.get("brain_stats", {})
+    print(f"\nLLM Stats:")
+    print(f"  API Calls: {stats.get('total_calls', 0)}")
+    print(f"  Total Tokens: {stats.get('total_tokens', 0)}")
+    print(f"  Avg Latency: {stats.get('avg_latency', 0):.2f}s")
+
+    if results.get("semantic_rules"):
+        print(f"\nLearned Rules:")
+        for rule in results["semantic_rules"]:
+            print(f"  • {rule}")
+
+    # Success rate
+    steps = results.get("steps", [])
+    if steps:
+        successes = sum(1 for s in steps if s.get("success"))
+        print(f"\nAction Success Rate: {successes}/{len(steps)} "
+              f"({100*successes/len(steps):.0f}%)")
+
+    print("=" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MemCraft Agent Runner")
+    parser.add_argument("--task", type=str, required=True,
+                        help="Task/goal description (e.g., 'mine 5 dirt blocks')")
+    parser.add_argument("--agent", type=str, default="memagent",
+                        choices=["memagent", "no_memory", "naive_memory", "compare"],
+                        help="Agent variant to run")
+    parser.add_argument("--host", type=str, default="localhost",
+                        help="Minecraft server host")
+    parser.add_argument("--port", type=int, default=25565,
+                        help="Minecraft server port")
+    parser.add_argument("--username", type=str, default="MemAgent",
+                        help="Bot username")
+    parser.add_argument("--version", type=str, default="1.20.4",
+                        help="Minecraft version")
+    parser.add_argument("--http-port", type=int, default=3001,
+                        help="Mineflayer bridge HTTP port")
+    parser.add_argument("--max-steps", type=int, default=50,
+                        help="Maximum steps per run")
+    parser.add_argument("--episodes", type=int, default=3,
+                        help="Number of episodes per agent (for compare mode)")
+    parser.add_argument("--model", type=str, default="api-llama-4-scout",
+                        help="LLM model name on TritonAI")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logging")
+    parser.add_argument("--no-bridge", action="store_true",
+                        help="Skip starting Mineflayer bridge (if already running)")
+    parser.add_argument("--config", type=str, default="configs/default.json",
+                        help="Config file path")
+
+    args = parser.parse_args()
+    setup_logging(args.debug)
+    logger = logging.getLogger("memcraft")
+
+    # Load config
+    config_path = Path(args.config)
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+    else:
+        config = {}
+
+    # Get API key
+    api_key = os.environ.get("TRITONAI_API_KEY")
+    if not api_key:
+        print("ERROR: Set TRITONAI_API_KEY environment variable")
+        print("  export TRITONAI_API_KEY='your-key-here'")
+        sys.exit(1)
+
+    # Ensure memories directory exists
+    Path("memories").mkdir(exist_ok=True)
+    Path("logs").mkdir(exist_ok=True)
+
+    # Start Mineflayer bridge
+    bridge_proc = None
+    if not args.no_bridge:
+        bridge_proc = start_mineflayer_bridge(
+            args.host, args.port, args.username, args.version, args.http_port
+        )
+        # Give it time to connect
+        logger.info("Waiting for bot to connect to Minecraft...")
+        time.sleep(5)
+
+    bot_url = f"http://localhost:{args.http_port}"
+    api_url = config.get("llm", {}).get(
+        "api_url", "https://tritonai-api.ucsd.edu/v1/chat/completions"
+    )
+
+    try:
+        if args.agent == "compare":
+            # Run all three agents for comparison across multiple episodes
+            all_results = {}
+            num_episodes = args.episodes
+
+            for agent_type in ["no_memory", "naive_memory", "memagent"]:
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Agent: {agent_type} | {num_episodes} episodes")
+                logger.info(f"{'='*50}")
+
+                all_results[agent_type] = []
+
+                for ep in range(num_episodes):
+                    logger.info(f"\n--- Episode {ep+1}/{num_episodes} ---")
+
+                    # Restart bridge for clean bot state
+                    if bridge_proc:
+                        try:
+                            requests.post(f"{bot_url}/disconnect", timeout=3)
+                        except:
+                            pass
+                        bridge_proc.terminate()
+                        try:
+                            bridge_proc.wait(timeout=5)
+                        except:
+                            bridge_proc.kill()
+                        time.sleep(3)
+
+                    bridge_proc = start_mineflayer_bridge(
+                        args.host, args.port, args.username,
+                        args.version, args.http_port
+                    )
+                    time.sleep(5)
+
+                    # Fresh brain per episode (for token tracking)
+                    # But MemAgent keeps semantic memory across episodes!
+                    brain = Brain(
+                        api_key=api_key,
+                        api_url=api_url,
+                        model=args.model,
+                        max_tokens=config.get("llm", {}).get("max_tokens", 512),
+                        temperature=config.get("llm", {}).get("temperature", 0.3),
+                    )
+
+                    try:
+                        results = run_single_agent(
+                            agent_type, brain, args.task, bot_url,
+                            args.max_steps, config
+                        )
+                    except Exception as e:
+                        logger.error(f"Episode failed: {e}")
+                        results = {
+                            "agent_type": agent_type,
+                            "goal": args.task,
+                            "success": False,
+                            "total_steps": 0,
+                            "brain_stats": brain.get_stats(),
+                            "steps": [],
+                        }
+
+                    results["episode"] = ep + 1
+                    all_results[agent_type].append(results)
+                    print_results(results)
+
+            # ─── Summary Table ───
+            print("\n" + "=" * 75)
+            print("COMPARISON SUMMARY")
+            print("=" * 75)
+            print(f"Task: {args.task} | Episodes: {num_episodes}")
+            print(f"{'Agent':<18} {'Success':<12} {'Avg Steps':<12} "
+                  f"{'Avg Tokens':<14} {'Avg Latency':<12}")
+            print("-" * 75)
+
+            for agent_type in ["no_memory", "naive_memory", "memagent"]:
+                episodes = all_results[agent_type]
+                successes = sum(1 for r in episodes if r.get("success"))
+                avg_steps = sum(r.get("total_steps", 0) for r in episodes) / max(len(episodes), 1)
+                avg_tokens = sum(r.get("brain_stats", {}).get("total_tokens", 0) for r in episodes) / max(len(episodes), 1)
+                avg_latency = sum(r.get("brain_stats", {}).get("avg_latency", 0) for r in episodes) / max(len(episodes), 1)
+
+                print(f"{agent_type:<18} "
+                      f"{successes}/{len(episodes):<10} "
+                      f"{avg_steps:<12.1f} "
+                      f"{avg_tokens:<14.0f} "
+                      f"{avg_latency:<12.2f}s")
+
+                # Show per-episode breakdown
+                for r in episodes:
+                    status = "✓" if r.get("success") else "✗"
+                    steps = r.get("total_steps", 0)
+                    tokens = r.get("brain_stats", {}).get("total_tokens", 0)
+                    print(f"  Ep{r.get('episode', '?')}: {status} "
+                          f"steps={steps} tokens={tokens}")
+
+            print("=" * 75)
+
+            # Save comparison
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            with open(f"logs/comparison_{timestamp}.json", "w") as f:
+                json.dump(all_results, f, indent=2, default=str)
+            logger.info(f"Comparison saved to logs/comparison_{timestamp}.json")
+
+        else:
+            # Run single agent
+            brain = Brain(
+                api_key=api_key,
+                api_url=api_url,
+                model=args.model,
+                max_tokens=config.get("llm", {}).get("max_tokens", 512),
+                temperature=config.get("llm", {}).get("temperature", 0.3),
+            )
+            results = run_single_agent(
+                args.agent, brain, args.task, bot_url,
+                args.max_steps, config
+            )
+            print_results(results)
+
+            # Save results
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            out_path = f"logs/run_{args.agent}_{timestamp}.json"
+            with open(out_path, "w") as f:
+                json.dump(results, f, indent=2, default=str)
+            logger.info(f"Results saved to {out_path}")
+
+    finally:
+        if bridge_proc:
+            logger.info("Shutting down Mineflayer bridge...")
+            try:
+                import requests as req
+                req.post(f"{bot_url}/disconnect", timeout=3)
+            except:
+                pass
+            bridge_proc.terminate()
+            bridge_proc.wait(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

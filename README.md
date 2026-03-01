@@ -1,363 +1,203 @@
-# MemAgent: Memory-Augmented Minecraft Agent
-## UCSD CSE/COGS Class Project
+# MemCraft: Hierarchical Memory for LLM-Based Minecraft Agents
 
----
+A hierarchical memory system for LLM-based Minecraft agents that enables learning across episodes. Built with Mineflayer (text-only, no vision) and evaluated on multi-step crafting tasks.
 
-## Table of Contents
-1. [Architecture Overview](#architecture)
-2. [Step-by-Step Setup](#setup)
-3. [How It Works](#how-it-works)
-4. [Running Experiments](#running)
-5. [Budget Management](#budget)
-6. [Evaluation & Results](#evaluation)
-7. [File Structure](#files)
-
----
-
-<a name="architecture"></a>
-## 1. Architecture Overview
-
-### The Arena: Three Agent Configurations
-
-| Agent | Input | Description |
-|-------|-------|-------------|
-| **No-Memory** (Baseline) | Current obs only | Purely reactive — no history, no retrieval |
-| **Naive Memory** (Baseline) | FIFO last L steps | Sliding window of raw history, no filtering |
-| **MemAgent** (Ours) | Structured Delta + BM25 + Rules | Full hierarchical memory system |
-
-### MemAgent System Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│          The Brain: Llama-4-Scout                │
-│          (via TritonAI UCSD API)                 │
-│          Reasoning & Action via JSON Schema      │
-├─────────────────────────────────────────────────┤
-│                                                  │
-│   ┌─────────────────┐  ┌──────────────────────┐ │
-│   │ Step Memory      │  │ Semantic Memory       │ │
-│   │ (Mstep)          │  │ (Msem)                │ │
-│   │                  │  │                       │ │
-│   │ Delta-filtered   │  │ Consolidated rules:   │ │
-│   │ trajectory of    │  │ constraints,          │ │
-│   │ recent actions & │  │ preconditions,        │ │
-│   │ observations     │  │ failure modes         │ │
-│   └────────┬────────┘  └──────────┬────────────┘ │
-│            │                      │              │
-│            ▼                      ▼              │
-│   ┌─────────────────────────────────────────┐    │
-│   │         BM25 Retrieval Engine            │    │
-│   │  Query = Goal + Inventory + Entity terms │    │
-│   │  → Top-K from Mstep & Msem              │    │
-│   └─────────────────────────────────────────┘    │
-│                      │                           │
-│                      ▼                           │
-│   ┌─────────────────────────────────────────┐    │
-│   │      Semantic Consolidation              │    │
-│   │  Every N steps: extract rules from       │    │
-│   │  trajectory, verify against evidence,    │    │
-│   │  discard if unsupported                  │    │
-│   └─────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│              The Brain (LLM)                │
+│   UCSD TritonAI API (Llama-4-Scout)         │
+│   Reasoning & Action via JSON Schema        │
+├──────────────┬──────────────────────────────┤
+│  Step Memory │    Semantic Memory           │
+│  (Mstep)     │    (Msem)                    │
+│  Recent acts,│    Consolidated rules,       │
+│  observations│    constraints, failure modes │
+├──────────────┴──────────────────────────────┤
+│         BM25 Retrieval + Consolidation      │
+│  Query = Goal + Inventory + Entity Terms    │
+│  Retrieve Top-K from Mstep & Msem          │
+├─────────────────────────────────────────────┤
+│         Mineflayer Bot (Node.js)            │
+│  Text observations: inventory, position,    │
+│  stats, equipment, environment, entities    │
+└─────────────────────────────────────────────┘
 ```
 
-### Data (Text Observation - No Vision)
-```
-inventory:  Item counts (e.g., dirt: 64)
-position:   {x, y, z, pitch, yaw}
-stats:      {health, food, oxygen}
-environment:{time, biome, raining}
-equipment:  Mainhand, offhand, armor
-nearby_entities: List of {type, distance} (Top-N)
-```
+## Three Agent Variants (Experiment Design)
 
----
+| Agent | Memory | Description |
+|-------|--------|-------------|
+| **NoMemory** | None | Current observation only. No history, no retrieval. |
+| **NaiveMemory** | FIFO buffer | Last L steps as raw text. No filtering or consolidation. |
+| **MemAgent** (Ours) | Hierarchical | Step memory + BM25 retrieval + semantic consolidation. Learns rules across episodes. |
 
-<a name="setup"></a>
-## 2. Step-by-Step Setup
+## Prerequisites
 
-### Step 1: Install Java 8 (MineDojo requirement)
+- **Python 3.10+**
+- **Node.js 18+**
+- **Minecraft Java Edition server** (1.19.2, running via Docker)
+- **UCSD TritonAI API key**
+
+## Quick Start
+
+### 1. Setup
+
 ```bash
-# Ubuntu/Debian
-sudo apt update && sudo apt install -y openjdk-8-jdk
-export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+cd MemCraft
 
-# macOS
-brew tap homebrew/cask-versions
-brew install --cask temurin8
-
-# Verify
-java -version  # should show 1.8.x
-```
-
-### Step 2: Create Python environment
-```bash
-conda create -n memagent python=3.9 -y
-conda activate memagent
-```
-
-### Step 3: Install dependencies
-```bash
-cd memagent/
+# Python dependencies
 pip install -r requirements.txt
+
+# Node.js dependencies
+cd mineflayer_bridge && npm install && cd ..
+
+# API key
+export TRITONAI_API_KEY="your-key-here"
 ```
 
-### Step 4: Install MineDojo
-```bash
-pip install minedojo
-
-# For headless servers (no display):
-sudo apt install -y xvfb
-export MINEDOJO_HEADLESS=1
-
-# Validate installation
-MINEDOJO_HEADLESS=1 python -m minedojo.scripts.validate_install
-```
-
-### Step 5: Set your API key
-```bash
-# Option A: Environment variable
-export TRITONAI_API_KEY="your-key-from-class"
-
-# Option B: .env file (recommended)
-echo 'TRITONAI_API_KEY=your-key-here' > .env
-```
-
-### Step 6: Quick test (Mock environment - no MineDojo needed)
-```bash
-# This tests the full pipeline without needing Minecraft
-python scripts/run_single.py --agent memagent --mock --max-steps 10 --verbose
-```
-
----
-
-<a name="how-it-works"></a>
-## 3. How It Works
-
-### The Agent Loop (every step)
-
-```
-1. ENV → raw observation (inventory, position, stats, entities, etc.)
-      ↓
-2. PARSE → TextObservation (structured text, no vision)
-      ↓
-3. DELTA → compute what changed vs. previous observation
-      ↓
-4. BM25 RETRIEVAL
-   • Build query: goal terms + inventory terms + entity terms
-   • Search Step Memory (Mstep) → top-K relevant trajectory entries
-   • Search Semantic Memory (Msem) → top-K relevant rules
-      ↓
-5. LLM PROMPT CONSTRUCTION
-   • System: "You are a Minecraft agent with memory..."
-   • User: goal + retrieved memories + current observation
-      ↓
-6. LLM RESPONSE (JSON)
-   • {"reasoning": "...", "action": "forward", "observation_note": "..."}
-      ↓
-7. STORE IN STEP MEMORY
-   • Only if delta filter passes (something meaningful changed)
-   • Prevents memory pollution from "walked forward, nothing happened"
-      ↓
-8. SEMANTIC CONSOLIDATION (every N steps)
-   • LLM extracts generalizable rules from recent trajectory
-   • Evidence check: verify each rule against last K steps
-   • Add verified rules to Semantic Memory
-   • Discard unsupported rules
-      ↓
-9. MAP ACTION → MineDojo format → env.step()
-```
-
-### Key Design Decisions
-
-**Delta Filtering (saves tokens & budget):**
-Instead of storing every step, we only store steps where inventory, health,
-equipment, or nearby entities changed. This cuts memory entries by ~60-70%
-while preserving all meaningful information.
-
-**BM25 over Embeddings (saves budget):**
-BM25 is CPU-only, zero-cost retrieval. No embedding API calls needed.
-Works great for keyword-matching on Minecraft terms (item names, entities).
-
-**Semantic Consolidation (the learning mechanism):**
-Every N steps, the agent reflects on its trajectory and extracts rules like:
-- "Sheep must be sheared with shears in mainhand to get wool"
-- "Spiders are hostile at night"
-- "Cannot mine stone without a pickaxe"
-These rules persist across episodes for the same task.
-
-**Evidence Check (prevents hallucination):**
-Before storing a rule, we verify it's actually supported by recent observations.
-Uses a cheap heuristic (word overlap) first, only calling LLM for ambiguous cases.
-
----
-
-<a name="running"></a>
-## 4. Running Experiments
-
-### Quick test with mock environment
-```bash
-# No MineDojo needed — simulated environment
-python scripts/run_single.py --agent memagent --mock --episodes 1 --max-steps 20 --verbose
-python scripts/run_single.py --agent no_memory --mock --episodes 1 --max-steps 20 --verbose
-```
-
-### Single agent on a real task
-```bash
-# Run MemAgent on wool harvesting
-MINEDOJO_HEADLESS=1 python scripts/run_single.py \
-    --agent memagent \
-    --task harvest_wool_with_shears_and_sheep \
-    --episodes 5 \
-    --max-steps 100
-
-# Run no-memory baseline
-MINEDOJO_HEADLESS=1 python scripts/run_single.py \
-    --agent no_memory \
-    --task harvest_wool_with_shears_and_sheep \
-    --episodes 5
-```
-
-### Full Arena experiment (all agents, all tasks)
-```bash
-MINEDOJO_HEADLESS=1 python scripts/run_experiment.py \
-    --tasks all \
-    --agents all \
-    --episodes 5 \
-    --max-steps 200
-```
-
-### Just compare two agents on one task
-```bash
-MINEDOJO_HEADLESS=1 python scripts/run_experiment.py \
-    --task harvest_milk \
-    --agents no_memory,memagent \
-    --episodes 10
-```
-
----
-
-<a name="budget"></a>
-## 5. Budget Management ($200 cap)
-
-### Cost Breakdown Estimate
-
-The TritonAI API is likely free/subsidized for students. But we track
-everything just in case:
-
-| Component | Tokens/Step | Steps/Episode | Episodes | Total |
-|-----------|------------|---------------|----------|-------|
-| No-Memory | ~400 | 200 | 20 | 1.6M tokens |
-| Naive | ~800 | 200 | 20 | 3.2M tokens |
-| MemAgent | ~600 | 200 | 20 | 2.4M tokens |
-| Consolidation | ~500 | every 10 steps | 20 | 200K tokens |
-
-**Total estimate: ~7-8M tokens across all experiments**
-
-If the API charges ~$0.01/1K tokens: ~$70-80 total.
-If free: $0.
-
-### Budget Safety Features
-- `TokenTracker` logs every API call to `logs/token_usage.csv`
-- Hard budget cutoff at $200 — experiments stop automatically
-- Delta filtering reduces MemAgent calls by ~30%
-- Evidence check heuristic avoids ~60% of verification LLM calls
-
-### Check budget mid-experiment
-```python
-from config.settings import TokenTracker
-print(TokenTracker.get_stats())
-```
-
----
-
-<a name="evaluation"></a>
-## 6. Evaluation & Results
-
-### Metrics
-- **Success Rate**: % of episodes where reward > 0
-- **Average Reward**: Mean total reward per episode
-- **Average Steps**: Mean steps to completion (lower = more efficient)
-- **Semantic Rules Learned**: How many rules MemAgent consolidated
-
-### Generate comparison
-```bash
-python -c "
-from evaluation.evaluator import Evaluator
-e = Evaluator(results_dir='logs')
-e.load_results()
-e.print_comparison()
-e.plot_comparison()  # saves to logs/comparison.png
-"
-```
-
-### Expected Results Pattern
-We expect:
-- **No-Memory** < **Naive** < **MemAgent** on success rate
-- MemAgent should be most token-efficient (delta filtering)
-- MemAgent semantic rules should show it learns task-specific knowledge
-- Naive Memory may degrade on long episodes (context window bloat)
-
----
-
-<a name="files"></a>
-## 7. File Structure
-
-```
-memagent/
-├── README.md                          # This file
-├── requirements.txt                   # Python dependencies
-├── .env                               # API key (create this)
-│
-├── config/
-│   ├── settings.py                    # Hyperparameters, budget tracking
-│   ├── prompts.py                     # All LLM prompt templates
-│   └── llm_client.py                  # TritonAI API wrapper
-│
-├── memory/
-│   ├── step_memory.py                 # Mstep: delta-filtered trajectory
-│   ├── semantic_memory.py             # Msem: consolidated rules
-│   ├── bm25_retriever.py             # BM25 retrieval from Mstep & Msem
-│   └── consolidation.py              # Semantic consolidation pipeline
-│
-├── agents/
-│   ├── base_agent.py                 # Abstract base agent
-│   ├── no_memory_agent.py            # Baseline: no memory
-│   ├── naive_memory_agent.py         # Baseline: FIFO sliding window
-│   └── mem_agent.py                  # MemAgent (ours): full system
-│
-├── env/
-│   └── minecraft_env.py              # MineDojo wrapper + text parser
-│
-├── evaluation/
-│   └── evaluator.py                  # Metrics, comparison, plotting
-│
-├── scripts/
-│   ├── run_experiment.py             # Full arena experiment
-│   └── run_single.py                 # Single agent quick test
-│
-└── logs/
-    ├── results.jsonl                 # Experiment results
-    ├── token_usage.csv               # API cost tracking
-    └── comparison.png                # Generated comparison chart
-```
-
----
-
-## Quick Start Cheatsheet
+### 2. Verify Setup
 
 ```bash
-# 1. Setup
-conda create -n memagent python=3.9 -y && conda activate memagent
-pip install -r requirements.txt
-echo 'TRITONAI_API_KEY=your-key' > .env
+# Test API connection
+python test_api.py
 
-# 2. Test (no MineDojo needed)
-python scripts/run_single.py --agent memagent --mock --max-steps 10 --verbose
-
-# 3. Real experiment
-MINEDOJO_HEADLESS=1 python scripts/run_experiment.py --tasks all --agents all --episodes 5
-
-# 4. See results
-python -c "from evaluation.evaluator import Evaluator; e=Evaluator('logs'); e.load_results(); e.print_comparison()"
+# Full diagnostics (checks server, dependencies, etc.)
+python diagnose.py --host localhost --port 25565 --version 1.19.2
 ```
+
+### 3. Run a Single Agent
+
+```bash
+# Simple task
+python run_agent.py --task "mine 5 dirt blocks" --agent memagent \
+    --port 25565 --version 1.19.2 --max-steps 15
+
+# Crafting task
+python run_agent.py --task "craft a wooden pickaxe" --agent memagent \
+    --port 25565 --version 1.19.2 --max-steps 20
+
+# Complex multi-step task
+python run_agent.py --task "craft a stone pickaxe" --agent memagent \
+    --port 25565 --version 1.19.2 --max-steps 40
+
+# With debug logging
+python run_agent.py --task "mine 5 dirt blocks" --agent memagent --debug
+```
+
+### 4. Run Comparison (All 3 Agents)
+
+The `reset_and_run.sh` script resets the Minecraft world to a fresh state and runs all three agents:
+
+```bash
+chmod +x reset_and_run.sh
+
+# Craft a wooden pickaxe (3 episodes each, max 30 steps)
+./reset_and_run.sh "craft a wooden pickaxe" 3 30
+
+# Craft a stone pickaxe (harder — needs wooden pickaxe first)
+./reset_and_run.sh "craft a stone pickaxe" 3 40
+
+# Craft an iron ingot (hardest — full tool progression + smelting)
+./reset_and_run.sh "craft an iron ingot" 3 60
+```
+
+The script:
+1. Clears MemAgent's learned rules (fair start)
+2. Deletes the Minecraft world and regenerates with seed `0` (forest biome)
+3. Restarts the Docker server
+4. Runs all 3 agents × N episodes on the same world
+5. Prints a comparison table and saves results to `logs/`
+
+### 5. Use a Different LLM Model
+
+```bash
+python run_agent.py --task "mine 5 dirt" --agent memagent \
+    --model api-gpt-oss-120b --max-steps 15
+```
+
+## Available Actions
+
+| Action | Description |
+|--------|-------------|
+| `find_and_mine_block` | Find and mine a block type (auto-equips best tool) |
+| `craft_item` | Craft an item (auto-places crafting table if needed) |
+| `smelt_item` | Smelt ore in a furnace (auto-crafts/places furnace, auto-selects fuel) |
+| `scan_surroundings` | Scan nearby blocks in a radius |
+| `move_forward` | Move forward N steps |
+| `move_to` | Pathfind to coordinates |
+| `equip_item` | Equip an item to hand/armor |
+| `collect_nearby_items` | Walk to and pick up nearby dropped items |
+
+## Task Difficulty Progression
+
+| Task | Steps | Key Challenge |
+|------|-------|--------------|
+| Mine 5 dirt | ~2-3 | Basic action execution |
+| Craft wooden pickaxe | ~4-6 | Multi-step crafting chain |
+| Craft stone pickaxe | ~10-15 | Tool dependency (need wooden pickaxe first) |
+| Craft iron ingot | ~20-30 | Full progression: tools → mining → smelting |
+
+## Project Structure
+
+```
+MemCraft/
+├── run_agent.py              # Main entry point (single + compare mode)
+├── evaluate.py               # Batch evaluation across tasks
+├── reset_and_run.sh          # World reset + comparison runner
+├── diagnose.py               # Setup diagnostics
+├── test_api.py               # API connection test
+├── requirements.txt
+├── .gitignore
+├── configs/
+│   └── default.json          # LLM, memory, agent configuration
+├── agent/
+│   ├── __init__.py
+│   ├── agent.py              # Agent variants (NoMemory, NaiveMemory, MemAgent)
+│   ├── brain.py              # LLM interface (TritonAI API)
+│   ├── memory.py             # Hierarchical memory (Mstep + Msem)
+│   ├── retrieval.py          # BM25 retrieval
+│   ├── consolidation.py      # Semantic rule consolidation
+│   └── observer.py           # Structured delta observations + session inventory
+├── mineflayer_bridge/
+│   ├── package.json
+│   ├── bot.js                # Mineflayer bot + HTTP bridge + reset/teleport
+│   └── actions.js            # All bot actions (mine, craft, smelt, move, etc.)
+├── memories/                 # Persisted semantic rules (gitignored)
+└── logs/                     # Run logs and comparison results (gitignored)
+```
+
+## How Memory Works
+
+1. **Step Memory (Mstep)**: Stores recent action-observation pairs with timestamps
+2. **BM25 Retrieval**: Queries step memory using goal + inventory keywords to find relevant past experiences
+3. **Semantic Consolidation**: Every N steps, the LLM extracts general rules from recent experiences (e.g., "Need a pickaxe to mine stone") and stores them in semantic memory
+4. **Cross-Episode Learning**: Semantic rules persist across episodes, so MemAgent improves over time while baselines start fresh each episode
+
+## Minecraft Server (Docker)
+
+The server runs via the `itzg/minecraft-server` Docker image:
+
+```bash
+# Check server status
+sudo docker ps
+
+# View server logs
+sudo docker logs mc-server --tail 20
+
+# Reset world manually
+sudo docker exec mc-server rm -rf /data/world /data/world_nether /data/world_the_end
+sudo docker restart mc-server
+
+# Change seed
+sudo docker exec mc-server sh -c 'sed -i "s/level-seed=.*/level-seed=0/" /data/server.properties'
+```
+
+## Budget
+
+- Uses `api-llama-4-scout` on TritonAI (cheapest available)
+- Text-only observations (no vision = massive token savings)
+- Delta encoding: only sends what changed since last step
+- BM25 retrieval: no embedding API calls needed
+- Estimated cost: ~$0.01-0.05 per episode

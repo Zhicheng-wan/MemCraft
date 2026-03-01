@@ -1,0 +1,13 @@
+{
+    "name": "memcraft-mineflayer-bridge",
+    "version": "1.0.0",
+    "description": "Mineflayer bridge for MemCraft agent",
+    "main": "bot.js",
+    "dependencies": {
+        "mineflayer": "^4.14.0",
+        "mineflayer-pathfinder": "^2.4.5",
+        "mineflayer-collectblock": "^1.4.1",
+        "express": "^4.18.2",
+        "vec3": "^0.1.10"
+    }
+}
