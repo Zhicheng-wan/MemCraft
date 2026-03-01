@@ -1,0 +1,9 @@
+minedojo
+requests
+# rank-bm25 — NOT needed, we have a built-in BM25Okapi in memory/bm25_retriever.py
+numpy
+pandas
+matplotlib
+seaborn
+python-dotenv
+tqdm
