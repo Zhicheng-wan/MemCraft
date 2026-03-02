@@ -1,0 +1,26 @@
+{
+    "llm": {
+        "api_url": "https://tritonai-api.ucsd.edu/v1/chat/completions",
+        "model": "api-llama-4-scout",
+        "max_tokens": 512,
+        "temperature": 0.3
+    },
+    "memory": {
+        "step_memory_capacity": 50,
+        "semantic_memory_capacity": 30,
+        "retrieval_top_k": 5,
+        "consolidation_interval": 10,
+        "consolidation_evidence_window": 5
+    },
+    "agent": {
+        "max_steps": 100,
+        "action_timeout_seconds": 10,
+        "observation_interval_ms": 500
+    },
+    "mineflayer": {
+        "host": "localhost",
+        "port": 25565,
+        "username": "MemAgent",
+        "version": "1.20.4"
+    }
+}
