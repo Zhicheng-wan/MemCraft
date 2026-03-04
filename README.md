@@ -107,7 +107,6 @@ memcraft/
 
 ## Budget Considerations ($200 cap)
 
-- Uses `api-llama-4-scout` (cheapest/fastest on TritonAI)
 - Text-only observations (no vision = massive token savings)
 - Delta encoding: only send what CHANGED since last step
 - BM25 retrieval: no embedding API calls needed
