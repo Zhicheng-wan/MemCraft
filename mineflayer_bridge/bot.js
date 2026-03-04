@@ -61,9 +61,19 @@ bot.on('kicked', (reason) => {
     lastError = `Kicked: ${reason}`;
 });
 
+let deathCount = 0;
+let lastDeathTime = 0;
+
 bot.on('death', () => {
-    console.log('[Bridge] Bot died!');
-    lastError = 'Bot died';
+    deathCount++;
+    lastDeathTime = Date.now();
+    lastError = `Bot died (death #${deathCount}). All items lost. Will respawn at spawn point.`;
+    console.log(`[Bridge] ${lastError}`);
+});
+
+// After respawn, log it
+bot.on('respawn', () => {
+    console.log(`[Bridge] Respawned after death #${deathCount}. Position: ${bot.entity.position}`);
 });
 
 // ─── Observation Builder ───
@@ -139,7 +149,9 @@ function getObservation() {
         },
         nearby_entities: nearbyEntities,
         nearby_blocks: nearbyBlocks,
-        last_error: lastError
+        last_error: lastError,
+        deaths: deathCount,
+        recently_died: (Date.now() - lastDeathTime) < 10000  // true if died in last 10s
     };
 }
 
@@ -192,44 +204,38 @@ app.post('/disconnect', (req, res) => {
 });
 
 app.post('/reset', async (req, res) => {
-    // Reset: clear inventory, remove drops, teleport to fresh surface location
+    // Reset: clear inventory, remove drops, teleport to surface
     try {
-        // Clear inventory multiple times (sometimes first /clear misses)
-        bot.chat(`/clear ${bot.username}`);
-        await new Promise(r => setTimeout(r, 500));
-        bot.chat(`/clear ${bot.username}`);
-        await new Promise(r => setTimeout(r, 500));
-
-        // Kill ALL dropped item entities
-        bot.chat('/kill @e[type=item]');
-        await new Promise(r => setTimeout(r, 500));
-
-        // Kill ALL experience orbs too
-        bot.chat('/kill @e[type=experience_orb]');
+        // Set time to day and kill hostile mobs to prevent deaths during episode
+        bot.chat('/time set day');
         await new Promise(r => setTimeout(r, 300));
+        bot.chat('/kill @e[type=!player]');
+        await new Promise(r => setTimeout(r, 500));
 
-        // Teleport to a random surface location (wider range to avoid old areas)
-        const offsetX = Math.floor(Math.random() * 400) - 200;
-        const offsetZ = Math.floor(Math.random() * 400) - 200;
-        
-        // First tp high, then spreadplayers to find safe ground
-        bot.chat(`/tp ${bot.username} ${offsetX} 300 ${offsetZ}`);
+        // Reset death counter for new episode
+        deathCount = 0;
+        lastDeathTime = 0;
+
+        // Clear inventory
+        bot.chat('/clear');
+        await new Promise(r => setTimeout(r, 500));
+
+        // Teleport to a random surface location nearby (spread out for variety)
+        // Pick a random offset so each episode starts at a slightly different spot
+        const offsetX = Math.floor(Math.random() * 200) - 100;
+        const offsetZ = Math.floor(Math.random() * 200) - 100;
+        bot.chat(`/tp ${bot.username} ${offsetX} 200 ${offsetZ}`);
         await new Promise(r => setTimeout(r, 1000));
 
+        // Now tp down to the actual surface (200 is above ground, let gravity work
+        // or use ~ ~ ~ after a spreadplayers)
+        // Better: use spreadplayers to find a safe surface spot
         bot.chat(`/spreadplayers ${offsetX} ${offsetZ} 0 50 false ${bot.username}`);
         await new Promise(r => setTimeout(r, 2000));
 
-        // Clear again after teleport (death drops, etc.)
-        bot.chat(`/clear ${bot.username}`);
+        // Clear again after teleport (in case of death from fall)
+        bot.chat('/clear');
         await new Promise(r => setTimeout(r, 500));
-        
-        // Kill nearby items at new location too
-        bot.chat('/kill @e[type=item]');
-        await new Promise(r => setTimeout(r, 300));
-
-        // Set gamemode to survival (in case it changed)
-        bot.chat(`/gamemode survival ${bot.username}`);
-        await new Promise(r => setTimeout(r, 300));
 
         const pos = bot.entity.position;
         const items = bot.inventory.items();

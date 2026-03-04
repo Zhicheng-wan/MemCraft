@@ -13,7 +13,7 @@ class Brain:
     """LLM interface that handles API calls and token tracking."""
 
     def __init__(self, api_key: str, api_url: str, model: str,
-                 max_tokens: int = 512, temperature: float = 0.3):
+                 max_tokens: int = 2048, temperature: float = 0.3):
         self.api_key = api_key
         self.api_url = api_url
         self.model = model
@@ -66,7 +66,7 @@ class Brain:
                 }
 
             data = response.json()
-            content = data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"] or ""
 
             # Track tokens
             usage = data.get("usage", {})
@@ -104,6 +104,8 @@ class Brain:
 
     def parse_json_response(self, content: str) -> Optional[dict]:
         """Try to parse JSON from LLM response, handling markdown fences."""
+        if not content:
+            return None
         content = content.strip()
         # Strip markdown code fences
         if content.startswith("```"):

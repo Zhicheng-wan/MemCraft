@@ -21,45 +21,89 @@ from .consolidation import Consolidator
 logger = logging.getLogger("memcraft")
 
 # --- Available actions description for the LLM ---
-ACTIONS_SCHEMA = """
-Available actions (respond with ONLY a JSON object, no other text):
+ACTIONS_SCHEMA_BASE = """
+You are a Minecraft bot. Respond with ONLY a JSON action object, no other text.
 
-MINING (auto-equips best tool):
-  {"name": "find_and_mine_block", "params": {"block_name": "<n>", "count": <1-5>}}
-    Examples: dirt, oak_log, birch_log, cobblestone, coal_ore, iron_ore
+== ACTIONS ==
 
-CRAFTING (auto-places crafting table when needed if you have 4+ planks):
-  {"name": "craft_item", "params": {"item_name": "<n>", "count": <int>}}
+MINE: {"name": "find_and_mine_block", "params": {"block_name": "<n>", "count": <1-5>}}
+  block_name examples: oak_log, birch_log, cobblestone, stone, coal_ore, iron_ore
 
-SMELTING (auto-crafts & places furnace if you have 8 cobblestone):
-  {"name": "smelt_item", "params": {"item_name": "<n>", "count": <int>}}
-    Example: smelt_item raw_iron 1 -> iron_ingot. Uses auto fuel (coal/planks/logs).
+CRAFT: {"name": "craft_item", "params": {"item_name": "<n>", "count": <int>}}
+  Crafting table is auto-placed if you have 4+ planks.
 
-RECIPE CHAINS:
-  Wooden pickaxe: mine 4 logs -> craft planks (count=4) -> craft stick -> craft wooden_pickaxe
-  Stone pickaxe: [wooden pickaxe first] -> mine 3 stone (gives cobblestone) -> craft stone_pickaxe
-  Iron ingot: [stone pickaxe first] -> mine iron_ore (gives raw_iron) -> mine coal_ore (fuel) -> smelt_item raw_iron 1
-  IMPORTANT: Match plank type to log type! oak_log -> oak_planks, birch_log -> birch_planks
-  NOTE: You can mine "stone" or "cobblestone" — both work. Same for "iron_ore" or "raw_iron".
+SMELT: {"name": "smelt_item", "params": {"item_name": "<n>", "count": <int>}}
+  Auto-crafts furnace if you have 8+ cobblestone. Auto-selects fuel.
 
-MOVEMENT:
-  {"name": "move_forward", "params": {"steps": <1-5>}}
-  {"name": "move_to", "params": {"x": <int>, "y": <int>, "z": <int>}}
+MOVE: {"name": "move_forward", "params": {"steps": <1-5>}}
+      {"name": "move_to", "params": {"x": <int>, "y": <int>, "z": <int>}}
 
-OTHER:
-  {"name": "equip_item", "params": {"item_name": "<n>", "destination": "hand"}}
-  {"name": "collect_nearby_items", "params": {}}
-  {"name": "scan_surroundings", "params": {"radius": <4-16>}}
-  {"name": "DONE", "params": {}}
-  {"name": "STUCK", "params": {}}
-
-RULES:
-- SESSION INVENTORY shows only items collected THIS run. Use DONE when goal item appears.
-- Use find_and_mine_block to mine. It auto-equips the best tool you have.
-- If an action fails, try a DIFFERENT approach. NEVER repeat a failed action more than once.
-- Convert ALL logs to planks before crafting other items.
-- To mine stone/ores you NEED a pickaxe. Craft one first!
+OTHER: {"name": "equip_item", "params": {"item_name": "<n>", "destination": "hand"}}
+       {"name": "scan_surroundings", "params": {"radius": <4-16>}}
+       {"name": "collect_nearby_items", "params": {}}
+       {"name": "DONE", "params": {}}
 """
+
+ACTIONS_RECIPES = """
+== STEP-BY-STEP RECIPES (follow the numbered steps IN ORDER) ==
+
+WOODEN PICKAXE (4 steps):
+  Step 1: {"name": "find_and_mine_block", "params": {"block_name": "oak_log", "count": 4}}
+  Step 2: {"name": "craft_item", "params": {"item_name": "oak_planks", "count": 4}}
+  Step 3: {"name": "craft_item", "params": {"item_name": "stick", "count": 2}}
+  Step 4: {"name": "craft_item", "params": {"item_name": "wooden_pickaxe", "count": 1}}
+
+STONE PICKAXE (do ALL of wooden pickaxe first, then 3 more steps):
+  Steps 1-4: Complete WOODEN PICKAXE recipe above
+  Step 5: {"name": "find_and_mine_block", "params": {"block_name": "cobblestone", "count": 3}}
+  Step 6: {"name": "craft_item", "params": {"item_name": "stick", "count": 2}}
+  Step 7: {"name": "craft_item", "params": {"item_name": "stone_pickaxe", "count": 1}}
+
+IRON PICKAXE (do ALL of stone pickaxe first, then 6 more steps):
+  Steps 1-7: Complete STONE PICKAXE recipe above
+  Step 8: {"name": "find_and_mine_block", "params": {"block_name": "cobblestone", "count": 5}}
+  Step 9: {"name": "find_and_mine_block", "params": {"block_name": "cobblestone", "count": 5}}
+  (You need 8+ cobblestone for a furnace. The 3 from Step 5 were CONSUMED to craft stone_pickaxe.)
+  Step 10: {"name": "find_and_mine_block", "params": {"block_name": "iron_ore", "count": 3}}
+  Step 11: {"name": "find_and_mine_block", "params": {"block_name": "coal_ore", "count": 1}}
+  Step 12: {"name": "smelt_item", "params": {"item_name": "raw_iron", "count": 3}}
+  Step 13: {"name": "craft_item", "params": {"item_name": "stick", "count": 2}}
+  Step 14: {"name": "craft_item", "params": {"item_name": "iron_pickaxe", "count": 1}}
+
+NOTE: If you see birch_log instead of oak_log, use birch_log -> birch_planks.
+"""
+
+ACTIONS_RULES_WITH_RECIPES = """
+== RULES ==
+- Look at your INVENTORY to decide which step you are on. Skip steps for items you already have.
+- If crafting fails with "No recipe" or "missing ingredient", you are probably missing sticks. Craft sticks first.
+- Only use move/scan if mining fails repeatedly. Do NOT explore unnecessarily.
+- Do NOT mine more than you need. 4 logs is enough for a pickaxe.
+- Iron ore and coal ore are found UNDERGROUND. You may need to dig down or find a cave.
+- To smelt, you need a furnace (8 cobblestone) AND fuel (coal or planks). The system auto-handles this.
+"""
+
+ACTIONS_RULES_NO_RECIPES = """
+== RULES ==
+- Think step by step about what you need. Check your INVENTORY before each action.
+- Logs can be crafted into planks. Planks can be crafted into sticks. Tools require sticks.
+- You need the right tool tier to mine harder materials (e.g., wooden pickaxe for stone, stone pickaxe for iron).
+- If crafting fails, you may be missing a prerequisite material.
+- If mining fails repeatedly, try moving to a new location.
+- Iron ore and coal ore are found UNDERGROUND.
+- To smelt, you need a furnace (crafted from cobblestone) and fuel (coal or planks).
+"""
+
+# Active schema - set by --no-recipes flag
+ACTIONS_SCHEMA = ACTIONS_SCHEMA_BASE + ACTIONS_RECIPES + ACTIONS_RULES_WITH_RECIPES
+
+def set_recipe_mode(use_recipes: bool):
+    """Switch between recipe and no-recipe schema."""
+    global ACTIONS_SCHEMA
+    if use_recipes:
+        ACTIONS_SCHEMA = ACTIONS_SCHEMA_BASE + ACTIONS_RECIPES + ACTIONS_RULES_WITH_RECIPES
+    else:
+        ACTIONS_SCHEMA = ACTIONS_SCHEMA_BASE + ACTIONS_RULES_NO_RECIPES
 
 
 
@@ -128,6 +172,10 @@ class BaseAgent:
                     logger.warning("Inventory may not be fully empty after reset")
             else:
                 logger.warning(f"Reset issue: {data.get('message')}")
+            # Wait for Mineflayer inventory sync after respawn
+            time.sleep(3)
+            # Force an observation to sync inventory state
+            self.get_observation()
             time.sleep(1)
         except Exception as e:
             logger.warning(f"Reset failed: {e}")
@@ -172,6 +220,8 @@ class BaseAgent:
             f"Goal check - raw_inv: {raw_inv}, baseline: {baseline}, "
             f"session_inv: {session_inv}"
         )
+        if session_inv:
+            logger.info(f"  Session inventory: {session_inv}")
 
         goal_lower = goal.lower()
 
@@ -268,12 +318,32 @@ class NoMemoryAgent(BaseAgent):
             action_params = action.get("params", {})
 
             if action_name == "DONE":
-                logger.info(f"Step {step}: Agent reports task complete!")
-                results["success"] = True
+                # Verify with programmatic check before accepting
+                verify_obs = self.get_observation()
+                if self.check_goal_complete(goal, verify_obs):
+                    logger.info(f"Step {step}: Agent reports task complete (verified)!")
+                    results["success"] = True
+                else:
+                    self._done_spam_count = getattr(self, '_done_spam_count', 0) + 1
+                    if self._done_spam_count >= 3:
+                        logger.warning(f"Step {step}: Agent spammed DONE {self._done_spam_count}x - treating as STUCK")
+                        break
+                    logger.warning(f"Step {step}: Agent said DONE but goal not verified - continuing")
+                    continue
                 break
+            else:
+                self._done_spam_count = 0
+
             if action_name == "STUCK":
                 logger.warning(f"Step {step}: Agent reports stuck!")
                 break
+
+            # Force a different action if stuck in a loop
+            if self._consecutive_fails >= 5:
+                logger.warning(f"Step {step}: Forcing move_forward to break loop (was: {action_name})")
+                action_name = "move_forward"
+                action_params = {"steps": 5}
+                self._consecutive_fails = 0
 
             result = self.execute_action(action_name, action_params)
             success = result.get("success", False)
@@ -374,10 +444,30 @@ class NaiveMemoryAgent(BaseAgent):
             action_params = action.get("params", {})
 
             if action_name == "DONE":
-                results["success"] = True
+                verify_obs = self.get_observation()
+                if self.check_goal_complete(goal, verify_obs):
+                    logger.info(f"Step {step}: Agent reports task complete (verified)!")
+                    results["success"] = True
+                else:
+                    self._done_spam_count = getattr(self, '_done_spam_count', 0) + 1
+                    if self._done_spam_count >= 3:
+                        logger.warning(f"Step {step}: Agent spammed DONE {self._done_spam_count}x - treating as STUCK")
+                        break
+                    logger.warning(f"Step {step}: Agent said DONE but goal not verified - continuing")
+                    continue
                 break
+            else:
+                self._done_spam_count = 0
+
             if action_name == "STUCK":
                 break
+
+            # Force a different action if stuck in a loop
+            if self._consecutive_fails >= 5:
+                logger.warning(f"Step {step}: Forcing move_forward to break loop (was: {action_name})")
+                action_name = "move_forward"
+                action_params = {"steps": 5}
+                self._consecutive_fails = 0
 
             result = self.execute_action(action_name, action_params)
             success = result.get("success", False)
@@ -454,10 +544,12 @@ class MemAgent(BaseAgent):
                      semantic_rules: str = "", **kwargs) -> tuple:
         system = (
             "You are a Minecraft bot with memory. You have:\n"
-            "1. Current observation (delta: what changed)\n"
+            "1. Current observation (what you see now)\n"
             "2. Retrieved relevant memories from past steps\n"
             "3. Learned rules from experience\n\n"
-            "Use all information to choose the BEST next action.\n"
+            "PRIORITIES: Mine and craft immediately. Do NOT waste steps on "
+            "scan_surroundings or move_to unless mining has failed 2+ times. "
+            "Follow the recipe chain step by step.\n"
             "Respond with ONLY a JSON action object.\n\n"
             f"{ACTIONS_SCHEMA}"
         )
@@ -575,12 +667,31 @@ class MemAgent(BaseAgent):
             action_params = action.get("params", {})
 
             if action_name == "DONE":
-                logger.info(f"Step {step}: Task complete!")
-                results["success"] = True
+                verify_obs = self.get_observation()
+                if self.check_goal_complete(goal, verify_obs):
+                    logger.info(f"Step {step}: Task complete (verified)!")
+                    results["success"] = True
+                else:
+                    self._done_spam_count = getattr(self, '_done_spam_count', 0) + 1
+                    if self._done_spam_count >= 3:
+                        logger.warning(f"Step {step}: Agent spammed DONE {self._done_spam_count}x - treating as STUCK")
+                        break
+                    logger.warning(f"Step {step}: Agent said DONE but goal not verified - continuing")
+                    continue
                 break
+            else:
+                self._done_spam_count = 0
+
             if action_name == "STUCK":
                 logger.warning(f"Step {step}: Agent stuck!")
                 break
+
+            # Force a different action if stuck in a loop
+            if self._consecutive_fails >= 5:
+                logger.warning(f"Step {step}: Forcing move_forward to break loop (was: {action_name})")
+                action_name = "move_forward"
+                action_params = {"steps": 5}
+                self._consecutive_fails = 0
 
             result = self.execute_action(action_name, action_params)
             success = result.get("success", False)

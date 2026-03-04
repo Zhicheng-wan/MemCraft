@@ -43,6 +43,12 @@ def reset_minecraft_world(container=MINECRAFT_CONTAINER, seed=MINECRAFT_SEED, wa
              f'sed -i "s/level-seed=.*/level-seed={seed}/" /data/server.properties'],
             check=True, capture_output=True, timeout=10
         )
+        # Set peaceful difficulty (no hostile mobs)
+        subprocess.run(
+            ["sudo", "docker", "exec", container, "sh", "-c",
+             'sed -i "s/difficulty=.*/difficulty=peaceful/" /data/server.properties'],
+            check=True, capture_output=True, timeout=10
+        )
         # Delete world
         subprocess.run(
             ["sudo", "docker", "exec", container, "rm", "-rf",
@@ -108,7 +114,7 @@ def start_mineflayer_bridge(host: str, port: int, username: str,
     logging.info(f"Starting Mineflayer bridge: {' '.join(cmd)}")
     proc = subprocess.Popen(
         cmd, cwd=bridge_dir,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdout=None, stderr=None,  # Let output flow to console for debugging
     )
     return proc
 
@@ -191,10 +197,20 @@ def main():
                         help="Skip starting Mineflayer bridge (if already running)")
     parser.add_argument("--config", type=str, default="configs/default.json",
                         help="Config file path")
+    parser.add_argument("--no-recipes", action="store_true",
+                        help="Disable recipe hints (agents must discover crafting sequences)")
+    parser.add_argument("--skip-agents", type=str, default="",
+                        help="Comma-separated agents to skip (e.g. no_memory,memagent)")
 
     args = parser.parse_args()
     setup_logging(args.debug)
     logger = logging.getLogger("memcraft")
+
+    # Set recipe mode
+    from agent.agent import set_recipe_mode
+    set_recipe_mode(not args.no_recipes)
+    if args.no_recipes:
+        logger.info("Recipe hints DISABLED - agents must discover crafting sequences")
 
     # Load config
     config_path = Path(args.config)
@@ -236,7 +252,15 @@ def main():
             all_results = {}
             num_episodes = args.episodes
 
+            skip_agents = [a.strip() for a in args.skip_agents.split(",") if a.strip()]
+
             for agent_type in ["no_memory", "naive_memory", "memagent"]:
+                if agent_type in skip_agents:
+                    logger.info(f"\n{'='*50}")
+                    logger.info(f"Skipping agent: {agent_type}")
+                    logger.info(f"{'='*50}")
+                    continue
+
                 logger.info(f"\n{'='*50}")
                 logger.info(f"Agent: {agent_type} | {num_episodes} episodes")
                 logger.info(f"{'='*50}")
@@ -259,7 +283,16 @@ def main():
                         except:
                             bridge_proc.kill()
                         bridge_proc = None
-                        time.sleep(2)
+                    
+                    # Kill any orphaned node processes on our port
+                    try:
+                        subprocess.run(
+                            ["pkill", "-f", "node bot.js"],
+                            capture_output=True, timeout=5
+                        )
+                    except:
+                        pass
+                    time.sleep(3)
 
                     reset_minecraft_world(wait=90)
 
@@ -309,6 +342,8 @@ def main():
             print("-" * 75)
 
             for agent_type in ["no_memory", "naive_memory", "memagent"]:
+                if agent_type not in all_results:
+                    continue
                 episodes = all_results[agent_type]
                 successes = sum(1 for r in episodes if r.get("success"))
                 avg_steps = sum(r.get("total_steps", 0) for r in episodes) / max(len(episodes), 1)

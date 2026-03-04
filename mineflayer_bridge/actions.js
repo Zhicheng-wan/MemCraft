@@ -1,5 +1,6 @@
 /**
  * actions.js - Available bot actions for MemCraft agent
+ * v2: Fixes item pickup, block placement, smelt recipe resolution
  * Each action returns a result object: { success: bool, message: string, data?: any }
  */
 
@@ -12,6 +13,84 @@ function setupActions(bot, mcData) {
     bot.pathfinder.setMovements(movements);
 
     const actions = {};
+
+    // ─── HELPERS ───
+
+    /**
+     * Try to place a block item from inventory onto a nearby solid surface.
+     * Tries many offsets, and if all fail, digs a spot to create a placement surface.
+     * Returns the placed block position or null.
+     */
+    async function placeBlockFromInventory(itemName) {
+        const item = bot.inventory.items().find(i => i.name === itemName);
+        if (!item) return null;
+
+        await bot.equip(item, 'hand');
+        const pos = bot.entity.position.floored();
+
+        // Expanded offset list: try adjacent, then further out
+        const offsets = [
+            // Standard: place on top of block below adjacent
+            { block: pos.offset(1, -1, 0), face: vec3(0, 1, 0) },
+            { block: pos.offset(-1, -1, 0), face: vec3(0, 1, 0) },
+            { block: pos.offset(0, -1, 1), face: vec3(0, 1, 0) },
+            { block: pos.offset(0, -1, -1), face: vec3(0, 1, 0) },
+            // Place on side of block next to us
+            { block: pos.offset(1, 0, 0), face: vec3(-1, 0, 0) },
+            { block: pos.offset(-1, 0, 0), face: vec3(1, 0, 0) },
+            { block: pos.offset(0, 0, 1), face: vec3(0, 0, -1) },
+            { block: pos.offset(0, 0, -1), face: vec3(0, 0, 1) },
+            // Place on block directly below us
+            { block: pos.offset(0, -1, 0), face: vec3(0, 1, 0) },
+            // Further out
+            { block: pos.offset(2, -1, 0), face: vec3(0, 1, 0) },
+            { block: pos.offset(-2, -1, 0), face: vec3(0, 1, 0) },
+            { block: pos.offset(0, -1, 2), face: vec3(0, 1, 0) },
+            { block: pos.offset(0, -1, -2), face: vec3(0, 1, 0) },
+        ];
+
+        for (const { block: bpos, face } of offsets) {
+            const b = bot.blockAt(bpos);
+            if (b && b.name !== 'air' && b.name !== 'water' && b.name !== 'lava') {
+                try {
+                    await bot.placeBlock(b, face);
+                    await new Promise(r => setTimeout(r, 500));
+                    return bpos.plus(face);
+                } catch (_) {}
+            }
+        }
+
+        // Last resort: dig a block in front to create a wall surface, then place against it
+        try {
+            const frontPos = pos.offset(1, 0, 0);
+            const frontBlock = bot.blockAt(frontPos);
+            if (frontBlock && frontBlock.name !== 'air') {
+                await bot.dig(frontBlock);
+                await new Promise(r => setTimeout(r, 300));
+                const wallBlock = bot.blockAt(pos.offset(2, 0, 0));
+                if (wallBlock && wallBlock.name !== 'air') {
+                    const reItem = bot.inventory.items().find(i => i.name === itemName);
+                    if (reItem) {
+                        await bot.equip(reItem, 'hand');
+                        await bot.placeBlock(wallBlock, vec3(-1, 0, 0));
+                        await new Promise(r => setTimeout(r, 500));
+                        return frontPos;
+                    }
+                }
+            }
+        } catch (_) {}
+
+        return null;
+    }
+
+    /**
+     * Count total of an item across all inventory stacks.
+     */
+    function countInventoryItem(itemName) {
+        return bot.inventory.items()
+            .filter(i => i.name === itemName)
+            .reduce((sum, i) => sum + i.count, 0);
+    }
 
     // ─── MOVEMENT ───
 
@@ -89,10 +168,10 @@ function setupActions(bot, mcData) {
 
     actions.find_and_mine_block = async ({ block_name, count = 1 }) => {
         try {
-            // Block name aliases: some items drop differently than the block name
+            // Block name aliases: map what agent asks for -> what block exists in world
             const blockAliases = {
-                'cobblestone': 'stone',      // mining stone drops cobblestone
-                'raw_iron': 'iron_ore',      // mining iron_ore drops raw_iron
+                'cobblestone': 'stone',
+                'raw_iron': 'iron_ore',
                 'raw_copper': 'copper_ore',
                 'raw_gold': 'gold_ore',
                 'diamond': 'diamond_ore',
@@ -100,84 +179,116 @@ function setupActions(bot, mcData) {
                 'redstone': 'redstone_ore',
                 'lapis_lazuli': 'lapis_ore',
             };
+
+            // What item the agent actually receives from mining
+            const dropMap = {
+                'stone': 'cobblestone',
+                'iron_ore': 'raw_iron',
+                'copper_ore': 'raw_copper',
+                'gold_ore': 'raw_gold',
+                'diamond_ore': 'diamond',
+                'coal_ore': 'coal',
+                'redstone_ore': 'redstone',
+                'lapis_ore': 'lapis_lazuli',
+            };
+
             const actualBlock = blockAliases[block_name] || block_name;
-            
+            const expectedDrop = dropMap[actualBlock] || actualBlock;
+
             const blockType = mcData.blocksByName[actualBlock];
             if (!blockType) {
-                return { success: false, message: `Unknown block: ${block_name} (tried ${actualBlock})` };
+                return { success: false, message: `Unknown block: ${block_name} (tried ${actualBlock}). Use stone instead of cobblestone.` };
             }
 
-            // Auto-equip the best tool for this block type
-            const toolPriority = ['diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe',
-                                  'diamond_axe', 'iron_axe', 'stone_axe', 'wooden_axe',
-                                  'diamond_shovel', 'iron_shovel', 'stone_shovel', 'wooden_shovel'];
-            const needsPickaxe = ['stone', 'cobblestone', 'iron_ore', 'coal_ore', 'copper_ore', 
+            // Auto-equip the best tool
+            const needsPickaxe = ['stone', 'cobblestone', 'iron_ore', 'coal_ore', 'copper_ore',
                                   'gold_ore', 'diamond_ore', 'lapis_ore', 'redstone_ore', 'furnace',
                                   'deepslate', 'andesite', 'granite', 'diorite'];
-            const needsAxe = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 
-                              'dark_oak_log', 'mangrove_log', 'oak_planks', 'birch_planks', 'crafting_table'];
-            const needsShovel = ['dirt', 'grass_block', 'sand', 'gravel', 'clay', 'red_sand'];
+            const needsAxe = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log',
+                              'dark_oak_log', 'mangrove_log', 'oak_planks', 'birch_planks',
+                              'spruce_planks', 'crafting_table'];
 
-            let bestTool = null;
-            if (needsPickaxe.includes(block_name)) {
-                bestTool = bot.inventory.items().find(i => i.name.includes('pickaxe'));
-            } else if (needsAxe.includes(block_name)) {
-                bestTool = bot.inventory.items().find(i => i.name.includes('axe') && !i.name.includes('pickaxe'));
-            } else if (needsShovel.includes(block_name)) {
-                bestTool = bot.inventory.items().find(i => i.name.includes('shovel'));
-            }
-            if (bestTool) {
-                try { await bot.equip(bestTool, 'hand'); } catch(_) {}
+            if (needsPickaxe.includes(actualBlock)) {
+                // Pick the best pickaxe available
+                const pickPriority = ['diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe'];
+                for (const pickName of pickPriority) {
+                    const pick = bot.inventory.items().find(i => i.name === pickName);
+                    if (pick) { try { await bot.equip(pick, 'hand'); } catch(_) {} break; }
+                }
+            } else if (needsAxe.includes(actualBlock)) {
+                const axe = bot.inventory.items().find(i => i.name.includes('axe') && !i.name.includes('pickaxe'));
+                if (axe) try { await bot.equip(axe, 'hand'); } catch(_) {}
             }
 
+            const beforeCount = countInventoryItem(expectedDrop);
             let mined = 0;
+
             for (let i = 0; i < count; i++) {
                 const block = bot.findBlock({
                     matching: blockType.id,
                     maxDistance: 32
                 });
                 if (!block) {
+                    const gained = countInventoryItem(expectedDrop) - beforeCount;
                     return {
-                        success: mined > 0,
-                        message: mined > 0 
-                            ? `Mined ${mined}/${count} ${block_name}. No more nearby.`
-                            : `No ${block_name} found nearby.`
+                        success: gained > 0,
+                        message: gained > 0
+                            ? `Found and broke ${mined} ${actualBlock}, collected ${gained} ${expectedDrop}. No more nearby.`
+                            : `No ${actualBlock} found within 32 blocks. Try moving to a new area or mining 'stone' for cobblestone.`
                     };
                 }
+
                 const targetPos = block.position.clone();
-                // Move close enough
-                await bot.pathfinder.goto(new GoalNear(targetPos.x, targetPos.y, targetPos.z, 4));
-                // Re-fetch the block at the target position (reference may be stale after moving)
-                const freshBlock = bot.blockAt(targetPos);
-                if (!freshBlock || freshBlock.name === 'air') {
-                    // Block was already mined (maybe by falling or another cause)
+
+                try {
+                    await bot.pathfinder.goto(new GoalNear(targetPos.x, targetPos.y, targetPos.z, 3));
+                } catch (moveErr) {
                     continue;
                 }
+
+                const freshBlock = bot.blockAt(targetPos);
+                if (!freshBlock || freshBlock.name === 'air') {
+                    continue;
+                }
+
                 try {
                     await bot.dig(freshBlock);
                     mined++;
-                    // Wait for item pickup
-                    await new Promise(r => setTimeout(r, 500));
-                    // Try to collect nearby dropped items
-                    const nearbyItems = Object.values(bot.entities).filter(
-                        e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 5
-                    );
-                    for (const item of nearbyItems.slice(0, 3)) {
-                        try {
-                            await bot.pathfinder.goto(
-                                new GoalNear(item.position.x, item.position.y, item.position.z, 0)
-                            );
-                        } catch (_) {}
+
+                    // Wait for drop + actively collect
+                    await new Promise(r => setTimeout(r, 600));
+                    for (let pickup = 0; pickup < 3; pickup++) {
+                        const nearbyItems = Object.values(bot.entities).filter(
+                            e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 6
+                        );
+                        if (nearbyItems.length === 0) break;
+                        for (const item of nearbyItems.slice(0, 3)) {
+                            try {
+                                await bot.pathfinder.goto(
+                                    new GoalNear(item.position.x, item.position.y, item.position.z, 0)
+                                );
+                            } catch (_) {}
+                        }
+                        await new Promise(r => setTimeout(r, 400));
                     }
                     await new Promise(r => setTimeout(r, 300));
                 } catch (digErr) {
+                    const gained = countInventoryItem(expectedDrop) - beforeCount;
                     return {
-                        success: mined > 0,
-                        message: `Mined ${mined}/${count}. Dig failed: ${digErr.message}`
+                        success: gained > 0,
+                        message: `Broke ${mined}/${count}. Dig failed: ${digErr.message}. Collected ${gained} ${expectedDrop}.`
                     };
                 }
             }
-            return { success: true, message: `Mined ${mined} ${block_name}` };
+
+            const gained = countInventoryItem(expectedDrop) - beforeCount;
+            if (gained < mined && gained < count) {
+                return {
+                    success: gained > 0,
+                    message: `Broke ${mined} ${actualBlock} but only picked up ${gained} ${expectedDrop}. Some items may have fallen into holes. Try collect_nearby_items.`
+                };
+            }
+            return { success: true, message: `Mined ${mined} ${block_name} (got ${gained} ${expectedDrop})` };
         } catch (e) {
             return { success: false, message: `Failed: ${e.message}` };
         }
@@ -202,35 +313,43 @@ function setupActions(bot, mcData) {
         try {
             const item = mcData.itemsByName[item_name];
             if (!item) {
-                return { success: false, message: `Unknown item: ${item_name}. Use underscores (e.g. oak_planks)` };
+                return { success: false, message: `Unknown item: ${item_name}. Use exact names with underscores (e.g. oak_planks not planks, stick not sticks)` };
             }
 
             const getInvStr = () => bot.inventory.items().map(i => `${i.name}:${i.count}`).join(', ');
-            
-            // First try without crafting table (2x2 recipes: planks, sticks, crafting_table)
+
+            // First try without crafting table (2x2 recipes)
             let recipes = bot.recipesFor(item.id, null, 1, null);
             if (recipes.length > 0) {
+                let crafted = 0;
                 for (let i = 0; i < count; i++) {
+                    recipes = bot.recipesFor(item.id, null, 1, null);
+                    if (recipes.length === 0) break;
                     await bot.craft(recipes[0], 1, null);
+                    crafted++;
+                }
+                if (crafted < count) {
+                    return { success: crafted > 0, message: `Crafted ${crafted}/${count} ${item_name} (ran out of materials). Have: [${getInvStr()}]` };
                 }
                 return { success: true, message: `Crafted ${count} ${item_name}` };
             }
 
-            // Need a crafting table (3x3 recipe) - find placed one, or place from inventory, or craft one
+            // Need a crafting table (3x3 recipe)
             let craftingTable = bot.findBlock({
                 matching: mcData.blocksByName.crafting_table?.id,
                 maxDistance: 32
             });
+            let wePlacedTable = false;
 
             if (!craftingTable) {
-                // Check if we already have a crafting table in inventory
                 let tableInv = bot.inventory.items().find(i => i.name === 'crafting_table');
-                
+
                 if (!tableInv) {
-                    // Need to craft one - requires 4 planks
-                    const hasPlanks = bot.inventory.items().find(i => i.name.includes('planks'));
-                    if (!hasPlanks || hasPlanks.count < 4) {
-                        return { success: false, message: `Need crafting table. Have no table and < 4 planks. Have: [${getInvStr()}]. Craft more planks from logs first!` };
+                    const totalPlanks = bot.inventory.items()
+                        .filter(i => i.name.includes('planks'))
+                        .reduce((sum, i) => sum + i.count, 0);
+                    if (totalPlanks < 4) {
+                        return { success: false, message: `Need crafting table. No table and only ${totalPlanks}/4 planks. Have: [${getInvStr()}]. Mine logs and craft planks first.` };
                     }
                     const tableItem = mcData.itemsByName.crafting_table;
                     const tableRecipes = bot.recipesFor(tableItem.id, null, 1, null);
@@ -238,40 +357,15 @@ function setupActions(bot, mcData) {
                         return { success: false, message: `Cannot craft crafting_table. Have: [${getInvStr()}]` };
                     }
                     await bot.craft(tableRecipes[0], 1, null);
-                    tableInv = bot.inventory.items().find(i => i.name === 'crafting_table');
                 }
 
-                // Place the crafting table from inventory
-                if (tableInv) {
-                    await bot.equip(tableInv, 'hand');
-                    const pos = bot.entity.position.floored();
-                    let placed = false;
-                    
-                    // Try multiple placement spots
-                    const offsets = [
-                        { block: pos.offset(1, -1, 0), face: vec3(0, 1, 0) },
-                        { block: pos.offset(0, -1, 1), face: vec3(0, 1, 0) },
-                        { block: pos.offset(-1, -1, 0), face: vec3(0, 1, 0) },
-                        { block: pos.offset(0, -1, -1), face: vec3(0, 1, 0) },
-                        { block: pos.offset(0, -1, 0), face: vec3(1, 0, 0) },
-                    ];
-                    for (const { block: bpos, face } of offsets) {
-                        const b = bot.blockAt(bpos);
-                        if (b && b.name !== 'air') {
-                            try {
-                                await bot.placeBlock(b, face);
-                                await new Promise(r => setTimeout(r, 500));
-                                placed = true;
-                                break;
-                            } catch (_) {}
-                        }
-                    }
-                    if (!placed) {
-                        return { success: false, message: `Have crafting_table but failed to place it` };
-                    }
+                // Place using robust helper
+                const placed = await placeBlockFromInventory('crafting_table');
+                if (!placed) {
+                    return { success: false, message: `Have crafting_table but failed to place it. Move to flat open ground and try again.` };
                 }
+                wePlacedTable = true;
 
-                // Find the placed table
                 craftingTable = bot.findBlock({
                     matching: mcData.blocksByName.crafting_table?.id,
                     maxDistance: 10
@@ -281,19 +375,44 @@ function setupActions(bot, mcData) {
                 }
             }
 
-            // Move to crafting table and craft
             await bot.pathfinder.goto(
                 new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3)
             );
 
             recipes = bot.recipesFor(item.id, null, 1, craftingTable);
             if (recipes.length === 0) {
-                const invStr = getInvStr();
-                return { success: false, message: `No recipe for ${item_name} at crafting table. Have: [${invStr}]. Missing materials?` };
+                return { success: false, message: `No recipe for ${item_name} at crafting table. Have: [${getInvStr()}]. Missing materials?` };
             }
 
+            let crafted = 0;
             for (let i = 0; i < count; i++) {
+                recipes = bot.recipesFor(item.id, null, 1, craftingTable);
+                if (recipes.length === 0) break;
                 await bot.craft(recipes[0], 1, craftingTable);
+                crafted++;
+            }
+
+            // Pick up crafting table after use so we carry it with us
+            if (wePlacedTable && craftingTable) {
+                try {
+                    const tableBlock = bot.blockAt(craftingTable.position);
+                    if (tableBlock && tableBlock.name === 'crafting_table') {
+                        await bot.dig(tableBlock);
+                        await new Promise(r => setTimeout(r, 500));
+                        // Walk to pick up the drop
+                        const drops = Object.values(bot.entities).filter(
+                            e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 5
+                        );
+                        for (const drop of drops.slice(0, 2)) {
+                            try { await bot.pathfinder.goto(new GoalNear(drop.position.x, drop.position.y, drop.position.z, 0)); } catch(_) {}
+                        }
+                        await new Promise(r => setTimeout(r, 300));
+                    }
+                } catch (_) { /* non-critical if pickup fails */ }
+            }
+
+            if (crafted < count) {
+                return { success: crafted > 0, message: `Crafted ${crafted}/${count} ${item_name} (ran out of materials). Have: [${getInvStr()}]` };
             }
             return { success: true, message: `Crafted ${count} ${item_name} (at crafting table)` };
         } catch (e) {
@@ -302,19 +421,189 @@ function setupActions(bot, mcData) {
         }
     };
 
+    // ─── SMELTING ───
+
+    const SMELT_RECIPES = {
+        'iron_ingot': 'raw_iron',
+        'gold_ingot': 'raw_gold',
+        'copper_ingot': 'raw_copper',
+        'glass': 'sand',
+        'stone': 'cobblestone',
+        'smooth_stone': 'stone',
+        'cooked_beef': 'beef',
+        'cooked_porkchop': 'porkchop',
+        'cooked_chicken': 'chicken',
+        'cooked_mutton': 'mutton',
+        'cooked_cod': 'cod',
+        'cooked_salmon': 'salmon',
+        'brick': 'clay_ball',
+        'charcoal': 'oak_log',
+        'dried_kelp': 'kelp',
+    };
+
+    const SMELT_INPUTS = {};
+    for (const [output, input] of Object.entries(SMELT_RECIPES)) {
+        SMELT_INPUTS[input] = output;
+    }
+
+    // Common wrong names agents use
+    const SMELT_ALIASES = {
+        'iron_ore': 'raw_iron',
+        'gold_ore': 'raw_gold',
+        'copper_ore': 'raw_copper',
+    };
+
+    actions.smelt_item = async ({ item_name, count = 1 }) => {
+        try {
+            const getInvStr = () => bot.inventory.items().map(i => `${i.name}:${i.count}`).join(', ');
+
+            // Resolve input/output names
+            let inputItem, outputName;
+            if (SMELT_ALIASES[item_name]) {
+                inputItem = SMELT_ALIASES[item_name];
+                outputName = SMELT_INPUTS[inputItem] || inputItem;
+            } else if (SMELT_RECIPES[item_name]) {
+                inputItem = SMELT_RECIPES[item_name];
+                outputName = item_name;
+            } else if (SMELT_INPUTS[item_name]) {
+                inputItem = item_name;
+                outputName = SMELT_INPUTS[item_name];
+            } else {
+                inputItem = item_name;
+                outputName = item_name;
+            }
+
+            // Check input material (sum across stacks)
+            const inputCount = countInventoryItem(inputItem);
+            if (inputCount < count) {
+                return {
+                    success: false,
+                    message: `Need ${count} ${inputItem} (to smelt into ${outputName}) but have ${inputCount}. Inventory: [${getInvStr()}]`
+                };
+            }
+
+            // Find fuel
+            const fuelPriority = ['coal', 'charcoal', 'oak_planks', 'birch_planks', 'spruce_planks',
+                                  'jungle_planks', 'acacia_planks', 'dark_oak_planks',
+                                  'oak_log', 'birch_log', 'spruce_log', 'stick'];
+            let fuelItem = null;
+            for (const fuelName of fuelPriority) {
+                fuelItem = bot.inventory.items().find(i => i.name === fuelName);
+                if (fuelItem) break;
+            }
+            if (!fuelItem) {
+                fuelItem = bot.inventory.items().find(i =>
+                    i.name.includes('planks') || i.name.includes('_log') || i.name === 'coal'
+                );
+            }
+            if (!fuelItem) {
+                return { success: false, message: `No fuel for smelting. Need coal, planks, or logs. Inventory: [${getInvStr()}]` };
+            }
+
+            // Find or place furnace
+            let furnaceBlock = bot.findBlock({
+                matching: mcData.blocksByName.furnace?.id,
+                maxDistance: 32
+            });
+
+            if (!furnaceBlock) {
+                let furnaceInv = bot.inventory.items().find(i => i.name === 'furnace');
+
+                if (!furnaceInv) {
+                    const cobbleTotal = countInventoryItem('cobblestone');
+                    if (cobbleTotal < 8) {
+                        return { success: false, message: `Need furnace. Have ${cobbleTotal}/8 cobblestone. Mine more stone first. Inventory: [${getInvStr()}]` };
+                    }
+
+                    let craftingTable = bot.findBlock({
+                        matching: mcData.blocksByName.crafting_table?.id,
+                        maxDistance: 32
+                    });
+                    if (!craftingTable) {
+                        let tableInv = bot.inventory.items().find(i => i.name === 'crafting_table');
+                        if (!tableInv) {
+                            const totalPlanks = bot.inventory.items()
+                                .filter(i => i.name.includes('planks'))
+                                .reduce((sum, i) => sum + i.count, 0);
+                            if (totalPlanks < 4) {
+                                return { success: false, message: `Need crafting table for furnace but no planks. Inventory: [${getInvStr()}]` };
+                            }
+                            const tableItemData = mcData.itemsByName.crafting_table;
+                            const tableRecipes = bot.recipesFor(tableItemData.id, null, 1, null);
+                            if (tableRecipes.length > 0) await bot.craft(tableRecipes[0], 1, null);
+                        }
+                        const placed = await placeBlockFromInventory('crafting_table');
+                        if (!placed) return { success: false, message: `Cannot place crafting_table for furnace. Move to flat ground.` };
+                        craftingTable = bot.findBlock({ matching: mcData.blocksByName.crafting_table?.id, maxDistance: 10 });
+                    }
+
+                    if (craftingTable) {
+                        await bot.pathfinder.goto(new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3));
+                        const furnaceItemData = mcData.itemsByName.furnace;
+                        const furnaceRecipes = bot.recipesFor(furnaceItemData.id, null, 1, craftingTable);
+                        if (furnaceRecipes.length > 0) {
+                            await bot.craft(furnaceRecipes[0], 1, craftingTable);
+                            furnaceInv = bot.inventory.items().find(i => i.name === 'furnace');
+                        }
+                    }
+                    if (!furnaceInv) return { success: false, message: `Failed to craft furnace. Inventory: [${getInvStr()}]` };
+                }
+
+                const placed = await placeBlockFromInventory('furnace');
+                if (!placed) return { success: false, message: `Have furnace but failed to place it. Move to flat open ground and try again.` };
+
+                furnaceBlock = bot.findBlock({ matching: mcData.blocksByName.furnace?.id, maxDistance: 10 });
+                if (!furnaceBlock) return { success: false, message: `Furnace not found after placing` };
+            }
+
+            await bot.pathfinder.goto(new GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 3));
+
+            const furnaceEntity = await bot.openFurnace(furnaceBlock);
+
+            const inputSlotItem = bot.inventory.items().find(i => i.name === inputItem);
+            if (inputSlotItem) await furnaceEntity.putInput(inputSlotItem.type, null, count);
+
+            await new Promise(r => setTimeout(r, 200));
+            const currentFuel = bot.inventory.items().find(i => i.name === fuelItem.name);
+            if (currentFuel) {
+                const fuelNeeded = Math.max(Math.ceil(count / 8), 1);
+                await furnaceEntity.putFuel(currentFuel.type, null, Math.min(currentFuel.count, fuelNeeded));
+            }
+
+            await new Promise(r => setTimeout(r, count * 11 * 1000));
+
+            const output = furnaceEntity.outputItem();
+            let smelted = 0;
+            if (output) {
+                smelted = output.count;
+                await furnaceEntity.takeOutput();
+            }
+
+            try {
+                if (furnaceEntity.inputItem()) await furnaceEntity.takeInput();
+                if (furnaceEntity.fuelItem()) await furnaceEntity.takeFuel();
+            } catch (_) {}
+
+            furnaceEntity.close();
+
+            if (smelted >= count) return { success: true, message: `Smelted ${smelted} ${outputName} (from ${inputItem})` };
+            if (smelted > 0) return { success: true, message: `Partially smelted ${smelted}/${count} ${outputName}. May need more fuel.` };
+            return { success: false, message: `Smelting produced 0 ${outputName}. Inventory: [${getInvStr()}]` };
+        } catch (e) {
+            const invStr = bot.inventory.items().map(i => `${i.name}:${i.count}`).join(', ');
+            return { success: false, message: `Smelt failed: ${e.message}. Inventory: [${invStr}]` };
+        }
+    };
+
     // ─── PLACEMENT ───
 
     actions.place_block = async ({ x, y, z, block_name }) => {
         try {
             const item = bot.inventory.items().find(i => i.name.includes(block_name));
-            if (!item) {
-                return { success: false, message: `No ${block_name} in inventory` };
-            }
+            if (!item) return { success: false, message: `No ${block_name} in inventory` };
             await bot.equip(item, 'hand');
             const referenceBlock = bot.blockAt(vec3(x, y, z));
-            if (!referenceBlock || referenceBlock.name === 'air') {
-                return { success: false, message: `No reference block at (${x}, ${y}, ${z})` };
-            }
+            if (!referenceBlock || referenceBlock.name === 'air') return { success: false, message: `No reference block at (${x}, ${y}, ${z})` };
             await bot.placeBlock(referenceBlock, vec3(0, 1, 0));
             return { success: true, message: `Placed ${block_name}` };
         } catch (e) {
@@ -326,171 +615,13 @@ function setupActions(bot, mcData) {
 
     actions.attack_nearest = async ({ entity_type }) => {
         try {
-            const entity = bot.nearestEntity(e =>
-                e.name === entity_type || e.displayName === entity_type
-            );
-            if (!entity) {
-                return { success: false, message: `No ${entity_type} nearby` };
-            }
+            const entity = bot.nearestEntity(e => e.name === entity_type || e.displayName === entity_type);
+            if (!entity) return { success: false, message: `No ${entity_type} nearby` };
             await bot.pathfinder.goto(new GoalNear(entity.position.x, entity.position.y, entity.position.z, 2));
             bot.attack(entity);
             return { success: true, message: `Attacked ${entity_type}` };
         } catch (e) {
             return { success: false, message: `Failed: ${e.message}` };
-        }
-    };
-
-    // ─── SMELTING ───
-
-    actions.smelt_item = async ({ item_name, fuel = 'auto', count = 1 }) => {
-        try {
-            const getInvStr = () => bot.inventory.items().map(i => `${i.name}:${i.count}`).join(', ');
-
-            // Find the input item in inventory
-            const inputItem = bot.inventory.items().find(i => i.name === item_name);
-            if (!inputItem || inputItem.count < count) {
-                return { success: false, message: `Need ${count} ${item_name} but have ${inputItem ? inputItem.count : 0}. Inventory: [${getInvStr()}]` };
-            }
-
-            // Find or craft+place a furnace
-            let furnaceBlock = bot.findBlock({
-                matching: mcData.blocksByName.furnace?.id,
-                maxDistance: 32
-            });
-
-            if (!furnaceBlock) {
-                // Try to craft a furnace (needs 8 cobblestone)
-                const cobble = bot.inventory.items().find(i => i.name === 'cobblestone');
-                if (!cobble || cobble.count < 8) {
-                    return { success: false, message: `Need furnace but don't have 8 cobblestone to craft one. Have: [${getInvStr()}]` };
-                }
-
-                // Need crafting table for furnace recipe
-                let craftingTable = bot.findBlock({
-                    matching: mcData.blocksByName.crafting_table?.id,
-                    maxDistance: 32
-                });
-                if (!craftingTable) {
-                    // Try to place one
-                    const tableInv = bot.inventory.items().find(i => i.name === 'crafting_table');
-                    if (!tableInv) {
-                        const planks = bot.inventory.items().find(i => i.name.includes('planks'));
-                        if (!planks || planks.count < 4) {
-                            return { success: false, message: `Need crafting table to craft furnace but no table or planks. Have: [${getInvStr()}]` };
-                        }
-                        const tableItem = mcData.itemsByName.crafting_table;
-                        const tableRecipes = bot.recipesFor(tableItem.id, null, 1, null);
-                        if (tableRecipes.length > 0) await bot.craft(tableRecipes[0], 1, null);
-                    }
-                    // Place crafting table
-                    const tInv = bot.inventory.items().find(i => i.name === 'crafting_table');
-                    if (tInv) {
-                        await bot.equip(tInv, 'hand');
-                        const pos = bot.entity.position.floored();
-                        const below = bot.blockAt(pos.offset(1, -1, 0));
-                        if (below && below.name !== 'air') {
-                            try { await bot.placeBlock(below, vec3(0, 1, 0)); } catch(_) {}
-                            await new Promise(r => setTimeout(r, 500));
-                        }
-                    }
-                    craftingTable = bot.findBlock({ matching: mcData.blocksByName.crafting_table?.id, maxDistance: 10 });
-                }
-
-                if (craftingTable) {
-                    await bot.pathfinder.goto(new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3));
-                    const furnaceItem = mcData.itemsByName.furnace;
-                    const furnaceRecipes = bot.recipesFor(furnaceItem.id, null, 1, craftingTable);
-                    if (furnaceRecipes.length > 0) {
-                        await bot.craft(furnaceRecipes[0], 1, craftingTable);
-                    } else {
-                        return { success: false, message: `No furnace recipe available. Have: [${getInvStr()}]` };
-                    }
-                }
-
-                // Place the furnace
-                const furnaceInv = bot.inventory.items().find(i => i.name === 'furnace');
-                if (furnaceInv) {
-                    await bot.equip(furnaceInv, 'hand');
-                    const pos = bot.entity.position.floored();
-                    const offsets = [
-                        { block: pos.offset(2, -1, 0), face: vec3(0, 1, 0) },
-                        { block: pos.offset(0, -1, 2), face: vec3(0, 1, 0) },
-                        { block: pos.offset(-2, -1, 0), face: vec3(0, 1, 0) },
-                        { block: pos.offset(0, -1, 0), face: vec3(1, 0, 0) },
-                    ];
-                    for (const { block: bpos, face } of offsets) {
-                        const b = bot.blockAt(bpos);
-                        if (b && b.name !== 'air') {
-                            try {
-                                await bot.placeBlock(b, face);
-                                await new Promise(r => setTimeout(r, 500));
-                                break;
-                            } catch (_) {}
-                        }
-                    }
-                }
-
-                furnaceBlock = bot.findBlock({ matching: mcData.blocksByName.furnace?.id, maxDistance: 10 });
-                if (!furnaceBlock) {
-                    return { success: false, message: `Failed to place furnace` };
-                }
-            }
-
-            // Move to furnace
-            await bot.pathfinder.goto(new GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 3));
-
-            // Open furnace
-            const furnace = await bot.openFurnace(furnaceBlock);
-
-            // Find fuel
-            let fuelItem;
-            if (fuel === 'auto') {
-                // Priority: coal > charcoal > oak_planks > any planks > any log
-                const fuelPriority = ['coal', 'charcoal', 'oak_planks', 'birch_planks', 'acacia_planks',
-                                      'spruce_planks', 'jungle_planks', 'dark_oak_planks',
-                                      'oak_log', 'birch_log', 'acacia_log', 'spruce_log'];
-                for (const fname of fuelPriority) {
-                    fuelItem = bot.inventory.items().find(i => i.name === fname);
-                    if (fuelItem) break;
-                }
-                if (!fuelItem) {
-                    // Any wood-like item
-                    fuelItem = bot.inventory.items().find(i => 
-                        i.name.includes('planks') || i.name.includes('log') || i.name === 'coal' || i.name === 'stick'
-                    );
-                }
-            } else {
-                fuelItem = bot.inventory.items().find(i => i.name === fuel);
-            }
-
-            if (!fuelItem) {
-                furnace.close();
-                return { success: false, message: `No fuel available. Have: [${getInvStr()}]. Need coal, planks, or logs as fuel.` };
-            }
-
-            // Put fuel and input
-            await furnace.putFuel(fuelItem.type, null, Math.min(fuelItem.count, count));
-            await new Promise(r => setTimeout(r, 200));
-            await furnace.putInput(inputItem.type, null, count);
-
-            // Wait for smelting (each item takes ~10s)
-            const waitTime = count * 11000;
-            await new Promise(r => setTimeout(r, waitTime));
-
-            // Take output
-            const output = furnace.outputItem();
-            if (output) {
-                await furnace.takeOutput();
-            }
-
-            furnace.close();
-            await new Promise(r => setTimeout(r, 500));
-
-            const newInv = getInvStr();
-            return { success: true, message: `Smelted ${count} ${item_name}. Inventory: [${newInv}]` };
-        } catch (e) {
-            const invStr = bot.inventory.items().map(i => `${i.name}:${i.count}`).join(', ');
-            return { success: false, message: `Smelt failed: ${e.message}. Inventory: [${invStr}]` };
         }
     };
 
@@ -503,20 +634,17 @@ function setupActions(bot, mcData) {
 
     actions.collect_nearby_items = async () => {
         try {
-            // Walk toward nearby items
             const items = Object.values(bot.entities).filter(e => e.name === 'item');
-            if (items.length === 0) {
-                return { success: true, message: 'No items nearby' };
-            }
-            for (const item of items.slice(0, 5)) {
+            if (items.length === 0) return { success: true, message: 'No items nearby' };
+            let collected = 0;
+            for (const item of items.slice(0, 8)) {
                 try {
-                    await bot.pathfinder.goto(
-                        new GoalNear(item.position.x, item.position.y, item.position.z, 0)
-                    );
-                } catch (_) { /* might be picked up already */ }
+                    await bot.pathfinder.goto(new GoalNear(item.position.x, item.position.y, item.position.z, 0));
+                    collected++;
+                } catch (_) {}
             }
             await new Promise(r => setTimeout(r, 500));
-            return { success: true, message: `Collected nearby items` };
+            return { success: true, message: `Walked to ${collected} nearby items` };
         } catch (e) {
             return { success: false, message: `Failed: ${e.message}` };
         }
@@ -536,16 +664,11 @@ function setupActions(bot, mcData) {
                     }
                 }
             }
-            // Sort by count, top 15
             const sorted = Object.entries(blocks)
                 .sort((a, b) => b[1] - a[1])
                 .slice(0, 15)
                 .map(([name, count]) => `${name}: ${count}`);
-            return {
-                success: true,
-                message: `Nearby blocks (r=${radius}): ${sorted.join(', ')}`,
-                data: blocks
-            };
+            return { success: true, message: `Nearby blocks (r=${radius}): ${sorted.join(', ')}`, data: blocks };
         } catch (e) {
             return { success: false, message: `Failed: ${e.message}` };
         }
