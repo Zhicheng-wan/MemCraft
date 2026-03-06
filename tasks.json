@@ -1,0 +1,24 @@
+{
+  "tasks": [
+    {"id": 1,  "type": "simple",  "task": "mine 5 dirt blocks",      "max_steps": 15},
+    {"id": 2,  "type": "simple",  "task": "mine 5 sand",              "max_steps": 15},
+    {"id": 3,  "type": "simple",  "task": "mine 5 gravel",            "max_steps": 15},
+    {"id": 4,  "type": "simple",  "task": "mine 8 oak_log",           "max_steps": 20},
+    {"id": 5,  "type": "simple",  "task": "mine 5 birch_log",         "max_steps": 20},
+    {"id": 6,  "type": "simple",  "task": "mine 8 cobblestone",       "max_steps": 25},
+    {"id": 7,  "type": "simple",  "task": "mine 3 coal",              "max_steps": 25},
+    {"id": 8,  "type": "simple",  "task": "mine 3 andesite",          "max_steps": 25},
+    {"id": 9,  "type": "simple",  "task": "craft a crafting_table",   "max_steps": 20},
+    {"id": 10, "type": "simple",  "task": "craft 8 oak_planks",       "max_steps": 15},
+    {"id": 11, "type": "simple",  "task": "craft 4 sticks",           "max_steps": 15},
+    {"id": 12, "type": "simple",  "task": "craft a wooden_pickaxe",   "max_steps": 25},
+    {"id": 13, "type": "simple",  "task": "craft a wooden_axe",       "max_steps": 25},
+    {"id": 14, "type": "simple",  "task": "craft a wooden_sword",     "max_steps": 25},
+    {"id": 15, "type": "simple",  "task": "craft a wooden_shovel",    "max_steps": 25},
+    {"id": 16, "type": "complex", "task": "craft a stone_pickaxe",    "max_steps": 35},
+    {"id": 17, "type": "complex", "task": "craft a stone_sword",      "max_steps": 35},
+    {"id": 18, "type": "complex", "task": "craft a furnace",          "max_steps": 40},
+    {"id": 19, "type": "complex", "task": "smelt 3 iron_ingot",       "max_steps": 50},
+    {"id": 20, "type": "complex", "task": "craft an iron_pickaxe",    "max_steps": 55}
+  ]
+}
