@@ -534,7 +534,6 @@ class MemAgent(BaseAgent):
         self.retriever = BM25Retriever()
         self.consolidator = Consolidator(
             brain=brain,
-            interval=mem_cfg.get("consolidation_interval", 10),
             evidence_window=mem_cfg.get("consolidation_evidence_window", 5),
         )
         self.retrieval_top_k = mem_cfg.get("retrieval_top_k", 5)
@@ -546,7 +545,7 @@ class MemAgent(BaseAgent):
             "You are a Minecraft bot with memory. You have:\n"
             "1. Current observation (what you see now)\n"
             "2. Retrieved relevant memories from past steps\n"
-            "3. Learned rules from experience\n\n"
+            "3. Learned rules from experience — these are MANDATORY constraints\n\n"
             "PRIORITIES: Mine and craft immediately. Do NOT waste steps on "
             "scan_surroundings or move_to unless mining has failed 2+ times. "
             "Follow the recipe chain step by step.\n"
@@ -559,7 +558,11 @@ class MemAgent(BaseAgent):
         if retrieved_memories:
             memory_block += f"RETRIEVED MEMORIES:\n{retrieved_memories}\n\n"
         if semantic_rules:
-            memory_block += f"LEARNED RULES:\n{semantic_rules}\n\n"
+            memory_block += (
+                f"*** LEARNED RULES — YOU MUST FOLLOW THESE ***\n"
+                f"{semantic_rules}\n"
+                f"*** Violating these rules will cause failure. Check them before choosing an action. ***\n\n"
+            )
 
         failure_warning = self.get_failure_warning()
         user = (
@@ -570,13 +573,15 @@ class MemAgent(BaseAgent):
         )
         return system, user
 
-    def run(self, goal: str, persist_memory: str = None) -> dict:
+    def run(self, goal: str, persist_memory: str = None,
+            persist_consolidation: str = None) -> dict:
         """
         Run the MemAgent loop.
 
         Args:
             goal: Task description (e.g., "mine 10 dirt blocks")
-            persist_memory: Optional filepath to load/save semantic memory
+            persist_memory: Optional filepath to load/save semantic memory JSON
+            persist_consolidation: Optional filepath to append consolidation event log JSON
         """
         logger.info(f"[MemAgent] Starting task: {goal}")
         self.wait_for_bot()
@@ -624,26 +629,14 @@ class MemAgent(BaseAgent):
                 query_terms, self.step_memory.get_all(),
                 top_k=self.retrieval_top_k
             )
-            # Retrieve from semantic memory
-            sem_results = self.retriever.retrieve(
-                query_terms, self.semantic_memory.get_all(),
-                top_k=3
-            )
-
             retrieved_text = ""
             if step_results:
                 lines = [f"  - {e['text']}" for e, score in step_results if score > 0]
                 if lines:
                     retrieved_text = "\n".join(lines)
 
-            rules_text = ""
-            if sem_results:
-                lines = [f"  - {e['text']}" for e, score in sem_results if score > 0]
-                if lines:
-                    rules_text = "\n".join(lines)
-            elif len(self.semantic_memory) > 0:
-                # If BM25 didn't match, still include top rules
-                rules_text = self.semantic_memory.get_rules_text()
+            # Always show all semantic rules so LLM has full memory context
+            rules_text = self.semantic_memory.get_rules_text() if len(self.semantic_memory) > 0 else ""
 
             # ── Think (LLM call) ──
             system, user = self.build_prompt(
@@ -719,6 +712,33 @@ class MemAgent(BaseAgent):
                 "tokens": response["tokens_used"],
             })
 
+            # ── Agentic memory update (after every action, including the final one) ──
+            mem_summary = self.consolidator.update_after_action(
+                action_name=action_name,
+                action_params=action_params,
+                action_result=result.get("message", ""),
+                action_success=success,
+                step_memory=self.step_memory,
+                semantic_memory=self.semantic_memory,
+                goal=goal,
+            )
+            if mem_summary["inserted"] or mem_summary["updated"] or mem_summary["deleted"]:
+                logger.info(
+                    f"Step {step}: Memory ops — "
+                    f"inserted={mem_summary['inserted']} "
+                    f"updated={mem_summary['updated']} "
+                    f"deleted={mem_summary['deleted']}"
+                )
+                if mem_summary.get("new_rules"):
+                    logger.info(f"  New rules: {mem_summary['new_rules']}")
+                results["consolidation_events"].append({
+                    "step": step,
+                    "inserted": mem_summary["inserted"],
+                    "updated": mem_summary["updated"],
+                    "deleted": mem_summary["deleted"],
+                    "new_rules": mem_summary.get("new_rules", []),
+                })
+
             # Programmatic goal check
             post_obs = self.get_observation()
             if self.check_goal_complete(goal, post_obs):
@@ -726,25 +746,34 @@ class MemAgent(BaseAgent):
                 results["success"] = True
                 break
 
-            # ── Consolidation check ──
-            if self.consolidator.should_consolidate(self.step_memory.step_counter):
-                logger.info(f"Step {step}: Running consolidation...")
-                new_rules = self.consolidator.consolidate(
-                    self.step_memory, self.semantic_memory, goal
-                )
-                if new_rules:
-                    logger.info(f"  New rules: {new_rules}")
-                    results["consolidation_events"].append({
-                        "step": step,
-                        "new_rules": new_rules
-                    })
-
             time.sleep(0.5)
 
         # ── Save semantic memory ──
         if persist_memory:
             self.semantic_memory.save(persist_memory)
             logger.info(f"Saved {len(self.semantic_memory)} rules to {persist_memory}")
+
+        # ── Append consolidation event log ──
+        if persist_consolidation and results["consolidation_events"]:
+            existing = []
+            try:
+                with open(persist_consolidation, "r") as f:
+                    existing = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            existing.append({
+                "goal": goal,
+                "timestamp": time.time(),
+                "success": results["success"],
+                "total_steps": len(results["steps"]),
+                "events": results["consolidation_events"],
+            })
+            with open(persist_consolidation, "w") as f:
+                json.dump(existing, f, indent=2)
+            logger.info(
+                f"Appended {len(results['consolidation_events'])} consolidation events "
+                f"to {persist_consolidation}"
+            )
 
         results["total_steps"] = len(results["steps"])
         results["brain_stats"] = self.brain.get_stats()

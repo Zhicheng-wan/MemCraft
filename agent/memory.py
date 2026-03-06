@@ -1,13 +1,15 @@
 """
 memory.py - Hierarchical Local Memory
 
-Two-tier memory system from the slides:
+Two-tier memory system:
   1. Step Memory (Mstep): High-fidelity trajectory of recent actions & observations
   2. Semantic Memory (Msem): Consolidated rules, constraints, and failure modes
+     - Stored as JSON with IDs, supports INSERT / UPDATE / DELETE operations
 """
 
 import json
 import time
+import uuid
 from typing import List, Optional
 from collections import deque
 
@@ -15,7 +17,7 @@ from collections import deque
 class StepMemory:
     """
     Step Memory (Mstep) - Short-term, high-fidelity trajectory.
-    
+
     Stores recent actions, observations, and outcomes.
     Uses a fixed-capacity FIFO with structured entries.
     """
@@ -77,42 +79,107 @@ class SemanticMemory:
     """
     Semantic Memory (Msem) - Long-term consolidated knowledge.
 
-    Stores rules, constraints, preconditions, and failure modes
-    that have been verified against evidence.
+    Stores rules, constraints, preconditions, and failure modes.
+    Each rule has a unique ID for targeted UPDATE and DELETE operations.
+    The LLM actively decides whether to insert, update, or delete rules.
     """
 
     def __init__(self, capacity: int = 30):
         self.capacity = capacity
-        self.rules: List[dict] = []
+        self.rules: List[dict] = []  # Each rule: {id, text, confidence, created_at, use_count}
 
-    def add_rule(self, rule_text: str, evidence_steps: List[int],
+    def _new_id(self) -> str:
+        """Generate a short unique rule ID."""
+        return uuid.uuid4().hex[:8]
+
+    def apply_operations(self, operations: List[dict]) -> dict:
+        """
+        Apply a list of memory operations decided by the LLM.
+
+        Each operation is one of:
+          {"op": "insert", "text": "...", "confidence": 0.9}
+          {"op": "update", "id": "abc123", "text": "...", "confidence": 0.95}
+          {"op": "delete", "id": "abc123"}
+
+        Returns a summary dict with counts of each op applied.
+        """
+        summary = {"inserted": 0, "updated": 0, "deleted": 0, "skipped": 0}
+
+        for op_item in operations:
+            op = op_item.get("op", "").lower()
+
+            if op == "insert":
+                text = op_item.get("text", "").strip()
+                if not text or len(text) < 10:
+                    summary["skipped"] += 1
+                    continue
+                # Enforce capacity: evict lowest-confidence rule
+                if len(self.rules) >= self.capacity:
+                    self.rules.sort(key=lambda r: r["confidence"])
+                    self.rules.pop(0)
+                self.rules.append({
+                    "id": self._new_id(),
+                    "text": text,
+                    "confidence": float(op_item.get("confidence", 0.8)),
+                    "created_at": time.time(),
+                    "use_count": 0,
+                })
+                summary["inserted"] += 1
+
+            elif op == "update":
+                rule_id = op_item.get("id", "")
+                text = op_item.get("text", "").strip()
+                for rule in self.rules:
+                    if rule["id"] == rule_id:
+                        if text:
+                            rule["text"] = text
+                        if "confidence" in op_item:
+                            rule["confidence"] = float(op_item["confidence"])
+                        summary["updated"] += 1
+                        break
+                else:
+                    summary["skipped"] += 1
+
+            elif op == "delete":
+                rule_id = op_item.get("id", "")
+                before = len(self.rules)
+                self.rules = [r for r in self.rules if r["id"] != rule_id]
+                if len(self.rules) < before:
+                    summary["deleted"] += 1
+                else:
+                    summary["skipped"] += 1
+
+            else:
+                summary["skipped"] += 1
+
+        return summary
+
+    # --- Legacy helpers (used by older code paths / retrieval) ---
+
+    def add_rule(self, rule_text: str, evidence_steps: List[int] = None,
                  confidence: float = 1.0):
-        """Add a verified rule."""
-        if len(self.rules) >= self.capacity:
-            # Remove lowest confidence rule
-            self.rules.sort(key=lambda r: r["confidence"])
-            self.rules.pop(0)
-
-        self.rules.append({
-            "text": rule_text,
-            "evidence_steps": evidence_steps,
-            "confidence": confidence,
-            "created_at": time.time(),
-            "use_count": 0,
-        })
+        """Add a rule directly (legacy / fallback)."""
+        self.apply_operations([{"op": "insert", "text": rule_text,
+                                "confidence": confidence}])
 
     def get_all(self) -> List[dict]:
         """Get all rules."""
         return self.rules
 
     def get_rules_text(self) -> str:
-        """Get all rules as text."""
+        """Get all rules as text (for prompts)."""
         if not self.rules:
             return "[No rules learned yet]"
         lines = []
-        for i, r in enumerate(self.rules):
-            lines.append(f"  Rule {i+1} (conf={r['confidence']:.1f}): {r['text']}")
+        for r in self.rules:
+            lines.append(
+                f"  [{r['id']}] (conf={r['confidence']:.1f}): {r['text']}"
+            )
         return "\n".join(lines)
+
+    def get_rules_for_prompt(self) -> str:
+        """Format rules with IDs so the LLM can reference them for UPDATE/DELETE."""
+        return self.get_rules_text()
 
     def mark_used(self, rule_text: str):
         """Increment use count for a rule."""
@@ -126,8 +193,7 @@ class SemanticMemory:
         rule_lower = rule_text.lower()
         for r in self.rules:
             existing = r["text"].lower()
-            # Check for significant overlap
-            if (rule_lower in existing or existing in rule_lower):
+            if rule_lower in existing or existing in rule_lower:
                 return True
         return False
 
@@ -138,14 +204,19 @@ class SemanticMemory:
         return len(self.rules)
 
     def save(self, filepath: str):
-        """Save semantic memory to file."""
+        """Save semantic memory to JSON file."""
         with open(filepath, "w") as f:
             json.dump(self.rules, f, indent=2)
 
     def load(self, filepath: str):
-        """Load semantic memory from file."""
+        """Load semantic memory from JSON file."""
         try:
             with open(filepath, "r") as f:
-                self.rules = json.load(f)
+                data = json.load(f)
+            # Migrate old format (rules without 'id') if needed
+            for rule in data:
+                if "id" not in rule:
+                    rule["id"] = self._new_id()
+            self.rules = data
         except FileNotFoundError:
             pass

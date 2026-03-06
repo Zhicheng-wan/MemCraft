@@ -42,10 +42,10 @@ for t in data['tasks']:
 TASK_COUNT=${#TASKS[@]}
 
 # ── 解析参数 ──────────────────────────────────────────────────────────────
-FROM=1
-TO=$TASK_COUNT
+FROM=16
+TO=20
 SINGLE=""
-EPISODES=3
+EPISODES=1
 MAX_STEPS_OVERRIDE=""
 MODEL="api-llama-4-scout"
 EXTRA_FLAGS=""
@@ -122,18 +122,21 @@ for ((i = FROM; i <= TO; i++)); do
     echo "  $task  (max ${MAX_STEPS} steps)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # 清空语义记忆（每个任务重新开始）
-    rm -f memories/semantic_rules.json
-    echo '[]' > memories/semantic_rules.json
+    # 每个任务使用独立的记忆文件（保留历史，方便对比）
+    MEMORY_FILE="memories/task_${i}_semantic.json"
+    if [ ! -f "$MEMORY_FILE" ]; then
+        echo '[]' > "$MEMORY_FILE"
+    fi
 
     python run_agent.py \
         --task "$task" \
-        --agent compare \
+        --agent memagent \
         --episodes $EPISODES \
         --port 25565 \
         --version 1.19.2 \
         --max-steps $MAX_STEPS \
         --model "$MODEL" \
+        --memory-file "$MEMORY_FILE" \
         $EXTRA_FLAGS
 
     EXIT_CODE=$?

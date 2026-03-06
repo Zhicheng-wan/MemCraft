@@ -120,7 +120,8 @@ def start_mineflayer_bridge(host: str, port: int, username: str,
 
 
 def run_single_agent(agent_type: str, brain: Brain, goal: str,
-                     bot_url: str, max_steps: int, config: dict) -> dict:
+                     bot_url: str, max_steps: int, config: dict,
+                     memory_file: str = "memories/semantic_rules.json") -> dict:
     """Run a single agent variant."""
     if agent_type == "no_memory":
         agent = NoMemoryAgent(brain, bot_url=bot_url, max_steps=max_steps)
@@ -134,7 +135,11 @@ def run_single_agent(agent_type: str, brain: Brain, goal: str,
         raise ValueError(f"Unknown agent type: {agent_type}")
 
     if agent_type == "memagent":
-        return agent.run(goal, persist_memory="memories/semantic_rules.json")
+        consolidation_file = memory_file.replace("_semantic.json", "_consolidation.json")
+        if consolidation_file == memory_file:
+            consolidation_file = memory_file.replace(".json", "_consolidation.json")
+        return agent.run(goal, persist_memory=memory_file,
+                         persist_consolidation=consolidation_file)
     else:
         return agent.run(goal)
 
@@ -201,6 +206,8 @@ def main():
                         help="Disable recipe hints (agents must discover crafting sequences)")
     parser.add_argument("--skip-agents", type=str, default="",
                         help="Comma-separated agents to skip (e.g. no_memory,memagent)")
+    parser.add_argument("--memory-file", type=str, default="memories/semantic_rules.json",
+                        help="Path to semantic memory JSON file for memagent")
 
     args = parser.parse_args()
     setup_logging(args.debug)
@@ -315,7 +322,8 @@ def main():
                     try:
                         results = run_single_agent(
                             agent_type, brain, args.task, bot_url,
-                            args.max_steps, config
+                            args.max_steps, config,
+                            memory_file=args.memory_file,
                         )
                     except Exception as e:
                         logger.error(f"Episode failed: {e}")
@@ -383,7 +391,8 @@ def main():
             )
             results = run_single_agent(
                 args.agent, brain, args.task, bot_url,
-                args.max_steps, config
+                args.max_steps, config,
+                memory_file=args.memory_file,
             )
             print_results(results)
 
