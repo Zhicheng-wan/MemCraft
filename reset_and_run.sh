@@ -130,7 +130,7 @@ for ((i = FROM; i <= TO; i++)); do
 
     python run_agent.py \
         --task "$task" \
-        --agent memagent \
+        --agent compare \
         --episodes $EPISODES \
         --port 25565 \
         --version 1.19.2 \
