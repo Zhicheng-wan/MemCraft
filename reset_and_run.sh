@@ -14,6 +14,7 @@
 #   $4 = model name (default: api-llama-4-scout)
 #   $5 = extra flags (e.g., "--no-recipes --skip-agents no_memory")
 
+
 TASK="${1:-craft a wooden pickaxe}"
 EPISODES="${2:-3}"
 MAX_STEPS="${3:-30}"

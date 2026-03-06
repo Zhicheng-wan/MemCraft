@@ -8,6 +8,8 @@ venv/
 .venv/
 *.egg
 
+reset_and_run.sh
+
 # Node
 node_modules/
 package-lock.json
