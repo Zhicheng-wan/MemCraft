@@ -13,7 +13,7 @@ import logging
 from typing import Optional
 
 from .brain import Brain
-from .memory import StepMemory, SemanticMemory
+from .memory import FifoHistory, ProceduralMemory, EpisodicMemory
 from .observer import Observer
 from .retrieval import BM25Retriever, build_query_terms
 from .consolidation import Consolidator
@@ -22,12 +22,13 @@ logger = logging.getLogger("memcraft")
 
 # --- Available actions description for the LLM ---
 ACTIONS_SCHEMA_BASE = """
-You are a Minecraft bot. Respond with ONLY a JSON action object, no other text.
+You are a Minecraft bot. First write ONE sentence of reasoning (what you have, what you need, what to do), then output the JSON action object on a new line.
 
 == ACTIONS ==
 
 MINE: {"name": "find_and_mine_block", "params": {"block_name": "<n>", "count": <1-5>}}
-  block_name examples: oak_log, birch_log, cobblestone, stone, coal_ore, iron_ore
+  block_name examples: oak_log, birch_log, stone, coal_ore, iron_ore, gold_ore
+  NOTE: use "stone" (not "cobblestone") — mining stone drops cobblestone items
 
 CRAFT: {"name": "craft_item", "params": {"item_name": "<n>", "count": <int>}}
   Crafting table is auto-placed if you have 4+ planks.
@@ -55,14 +56,14 @@ WOODEN PICKAXE (4 steps):
 
 STONE PICKAXE (do ALL of wooden pickaxe first, then 3 more steps):
   Steps 1-4: Complete WOODEN PICKAXE recipe above
-  Step 5: {"name": "find_and_mine_block", "params": {"block_name": "cobblestone", "count": 3}}
+  Step 5: {"name": "find_and_mine_block", "params": {"block_name": "stone", "count": 3}}
   Step 6: {"name": "craft_item", "params": {"item_name": "stick", "count": 2}}
   Step 7: {"name": "craft_item", "params": {"item_name": "stone_pickaxe", "count": 1}}
 
 IRON PICKAXE (do ALL of stone pickaxe first, then 6 more steps):
   Steps 1-7: Complete STONE PICKAXE recipe above
-  Step 8: {"name": "find_and_mine_block", "params": {"block_name": "cobblestone", "count": 5}}
-  Step 9: {"name": "find_and_mine_block", "params": {"block_name": "cobblestone", "count": 5}}
+  Step 8: {"name": "find_and_mine_block", "params": {"block_name": "stone", "count": 5}}
+  Step 9: {"name": "find_and_mine_block", "params": {"block_name": "stone", "count": 5}}
   (You need 8+ cobblestone for a furnace. The 3 from Step 5 were CONSUMED to craft stone_pickaxe.)
   Step 10: {"name": "find_and_mine_block", "params": {"block_name": "iron_ore", "count": 3}}
   Step 11: {"name": "find_and_mine_block", "params": {"block_name": "coal_ore", "count": 1}}
@@ -77,10 +78,10 @@ ACTIONS_RULES_WITH_RECIPES = """
 == RULES ==
 - Look at your INVENTORY to decide which step you are on. Skip steps for items you already have.
 - If crafting fails with "No recipe" or "missing ingredient", you are probably missing sticks. Craft sticks first.
-- Only use move/scan if mining fails repeatedly. Do NOT explore unnecessarily.
-- Do NOT mine more than you need. 4 logs is enough for a pickaxe.
 - Iron ore and coal ore are found UNDERGROUND. You may need to dig down or find a cave.
 - To smelt, you need a furnace (8 cobblestone) AND fuel (coal or planks). The system auto-handles this.
+- If mining fails or times out, use move_forward(steps=3) to relocate, then retry. Do not switch to a different resource.
+- If items fell into holes, use collect_nearby_items before doing anything else.
 """
 
 ACTIONS_RULES_NO_RECIPES = """
@@ -122,6 +123,10 @@ class BaseAgent:
         self._last_action_key = None
         self._consecutive_fails = 0
         self._max_consecutive_fails = 3  # Force different action after 3 same failures
+        self._repeat_fail_threshold = 3
+        self._action_fail_counts = {}
+        self._coarse_action_fail_counts = {}
+        self._last_result_message = ""
 
     def get_observation(self) -> dict:
         """Get observation from Mineflayer bot."""
@@ -138,7 +143,7 @@ class BaseAgent:
             resp = requests.post(
                 f"{self.bot_url}/action",
                 json={"name": action_name, "params": params},
-                timeout=60
+                timeout=100
             )
             return resp.json()
         except Exception as e:
@@ -187,14 +192,60 @@ class BaseAgent:
             return parsed
         return None
 
-    def track_action_result(self, action_name: str, params: dict, success: bool):
+    def _coarse_action_key(self, action_name: str, params: dict) -> str:
+        """Coarse key groups equivalent retries (e.g. stone count=3 vs count=5)."""
+        if action_name == "find_and_mine_block":
+            return f"{action_name}:{params.get('block_name', '')}"
+        if action_name in {"craft_item", "smelt_item"}:
+            return f"{action_name}:{params.get('item_name', '')}"
+        return action_name
+
+    def track_action_result(self, action_name: str, params: dict, success: bool,
+                            result_message: str = ""):
         """Track consecutive identical actions (both failed AND successful repeats)."""
         action_key = f"{action_name}:{json.dumps(params, sort_keys=True)}"
+        coarse_key = self._coarse_action_key(action_name, params)
+
         if action_key == self._last_action_key:
             self._consecutive_fails += 1
         else:
             self._consecutive_fails = 0
         self._last_action_key = action_key
+        self._last_result_message = result_message or ""
+
+        if success:
+            self._action_fail_counts[action_key] = 0
+            self._coarse_action_fail_counts[coarse_key] = 0
+        else:
+            self._action_fail_counts[action_key] = self._action_fail_counts.get(action_key, 0) + 1
+            self._coarse_action_fail_counts[coarse_key] = self._coarse_action_fail_counts.get(coarse_key, 0) + 1
+
+    def maybe_override_repeated_failure(self, action_name: str, params: dict) -> tuple:
+        """
+        Hard guardrail against retry loops:
+        if a (coarse) action failed repeatedly, force a recovery action.
+        """
+        action_key = f"{action_name}:{json.dumps(params, sort_keys=True)}"
+        coarse_key = self._coarse_action_key(action_name, params)
+        fail_count = max(
+            self._action_fail_counts.get(action_key, 0),
+            self._coarse_action_fail_counts.get(coarse_key, 0),
+        )
+        if fail_count < self._repeat_fail_threshold:
+            return action_name, params
+
+        msg = (self._last_result_message or "").lower()
+        if action_name != "collect_nearby_items" and (
+            "collect_nearby_items" in msg or
+            "fell into holes" in msg or
+            "picked up 0" in msg
+        ):
+            return "collect_nearby_items", {}
+        if action_name == "find_and_mine_block":
+            return "scan_surroundings", {"radius": 8}
+        if action_name != "move_forward":
+            return "move_forward", {"steps": 5}
+        return action_name, params
 
     def get_failure_warning(self) -> str:
         """Return warning text if agent is stuck repeating an action."""
@@ -345,9 +396,22 @@ class NoMemoryAgent(BaseAgent):
                 action_params = {"steps": 5}
                 self._consecutive_fails = 0
 
+            # Hard guard: avoid repeatedly failing the same action pattern
+            forced_name, forced_params = self.maybe_override_repeated_failure(
+                action_name, action_params
+            )
+            if forced_name != action_name or forced_params != action_params:
+                logger.warning(
+                    f"Step {step}: Repeated failures on {action_name}({action_params}) - "
+                    f"forcing {forced_name}({forced_params})"
+                )
+                action_name, action_params = forced_name, forced_params
+
             result = self.execute_action(action_name, action_params)
             success = result.get("success", False)
-            self.track_action_result(action_name, action_params, success)
+            self.track_action_result(
+                action_name, action_params, success, result.get("message", "")
+            )
             logger.info(
                 f"Step {step}: {action_name}({action_params}) → "
                 f"{'✓' if success else '✗'} {result.get('message', '')}"
@@ -385,7 +449,7 @@ class NaiveMemoryAgent(BaseAgent):
     def __init__(self, *args, history_length: int = 10, **kwargs):
         super().__init__(*args, **kwargs)
         self.history_length = history_length
-        self.step_memory = StepMemory(capacity=history_length)
+        self.step_memory = FifoHistory(capacity=history_length)
 
     def build_prompt(self, goal: str, observation: str,
                      history: str = "", **kwargs) -> tuple:
@@ -469,16 +533,28 @@ class NaiveMemoryAgent(BaseAgent):
                 action_params = {"steps": 5}
                 self._consecutive_fails = 0
 
+            # Hard guard: avoid repeatedly failing the same action pattern
+            forced_name, forced_params = self.maybe_override_repeated_failure(
+                action_name, action_params
+            )
+            if forced_name != action_name or forced_params != action_params:
+                logger.warning(
+                    f"Step {step}: Repeated failures on {action_name}({action_params}) - "
+                    f"forcing {forced_name}({forced_params})"
+                )
+                action_name, action_params = forced_name, forced_params
+
             result = self.execute_action(action_name, action_params)
             success = result.get("success", False)
-            self.track_action_result(action_name, action_params, success)
+            self.track_action_result(
+                action_name, action_params, success, result.get("message", "")
+            )
 
             # Store in FIFO (full observation, no delta)
             self.step_memory.add(
                 action=f"{action_name}({json.dumps(action_params)})",
-                observation=obs_text,
                 result=result.get("message", ""),
-                success=success
+                success=success,
             )
 
             logger.info(
@@ -525,80 +601,85 @@ class MemAgent(BaseAgent):
         cfg = config or {}
         mem_cfg = cfg.get("memory", {})
 
-        self.step_memory = StepMemory(
-            capacity=mem_cfg.get("step_memory_capacity", 50)
+        # Four-layer memory
+        self.procedural_memory = ProceduralMemory(
+            capacity=mem_cfg.get("procedural_memory_capacity", 20)
         )
-        self.semantic_memory = SemanticMemory(
-            capacity=mem_cfg.get("semantic_memory_capacity", 30)
+        self.episodic_memory = EpisodicMemory(
+            capacity=mem_cfg.get("episodic_memory_capacity", 30)
         )
         self.retriever = BM25Retriever()
         self.consolidator = Consolidator(
             brain=brain,
-            evidence_window=mem_cfg.get("consolidation_evidence_window", 5),
+            skill_extraction_window=mem_cfg.get("skill_extraction_window", 5),
         )
         self.retrieval_top_k = mem_cfg.get("retrieval_top_k", 5)
+        self.skill_extract_every = mem_cfg.get("skill_extract_every_n_steps", 10)
 
     def build_prompt(self, goal: str, observation: str,
-                     retrieved_memories: str = "",
-                     semantic_rules: str = "", **kwargs) -> tuple:
+                     procedures: str = "", episodes: str = "",
+                     last_result: str = "") -> tuple:
         system = (
-            "You are a Minecraft bot with memory. You have:\n"
-            "1. Current observation (what you see now)\n"
-            "2. Retrieved relevant memories from past steps\n"
-            "3. Learned rules from experience — these are MANDATORY constraints\n\n"
-            "PRIORITIES: Mine and craft immediately. Do NOT waste steps on "
-            "scan_surroundings or move_to unless mining has failed 2+ times. "
-            "Follow the recipe chain step by step.\n"
+            "You are a Minecraft bot with three types of memory:\n\n"
+            "1. WORKING MEMORY — your current game state (shown below as CURRENT STATE).\n"
+            "2. PROCEDURAL MEMORY — proven skill sequences you have learned. "
+            "Use these to execute multi-step tasks efficiently.\n"
+            "3. EPISODIC MEMORY — lessons from past failures. "
+            "These MUST be heeded to avoid repeating mistakes.\n\n"
+            "Priority: EPISODIC lessons override everything. "
+            "PROCEDURAL skills override trial-and-error guessing.\n\n"
+            "Action priorities:\n"
+            "- Mine and craft immediately. Do NOT waste steps on scan_surroundings or move_to "
+            "unless mining has failed 2+ times.\n"
+            "- Follow the recipe chain step by step.\n\n"
             "Respond with ONLY a JSON action object.\n\n"
             f"{ACTIONS_SCHEMA}"
         )
 
-        # Build memory block (injected into prompt)
         memory_block = ""
-        if retrieved_memories:
-            memory_block += f"RETRIEVED MEMORIES:\n{retrieved_memories}\n\n"
-        if semantic_rules:
-            memory_block += (
-                f"*** LEARNED RULES — YOU MUST FOLLOW THESE ***\n"
-                f"{semantic_rules}\n"
-                f"*** Violating these rules will cause failure. Check them before choosing an action. ***\n\n"
-            )
+        if procedures:
+            memory_block += f"PROCEDURAL MEMORY (learned skills):\n{procedures}\n\n"
+        if episodes:
+            memory_block += f"EPISODIC MEMORY (lessons from failures — MUST follow):\n{episodes}\n\n"
 
         failure_warning = self.get_failure_warning()
+        last_result_block = ""
+        if last_result:
+            last_result_block = f"LAST ACTION RESULT: {last_result}\n\n"
+
         user = (
             f"GOAL: {goal}\n\n"
             f"{memory_block}"
-            f"CURRENT STATE (changes since last step):\n{observation}{failure_warning}\n\n"
-            f"Choose your next action (JSON only):"
+            f"CURRENT STATE (working memory):\n{observation}{failure_warning}\n\n"
+            f"{last_result_block}"
+            f"DECISION CHECK (answer in order before acting):\n"
+            f"1. See 'Missing for goal' or 'READY TO CRAFT' above — act on it directly.\n"
+            f"2. If READY TO CRAFT → execute the craft/smelt action RIGHT NOW.\n"
+            f"3. If missing materials → get ONLY that specific item. "
+            f"NEVER mine/collect something you already have enough of in inventory.\n\n"
+            f"Reasoning (1 sentence: what I have / what I need / what I'll do), then JSON action:"
         )
         return system, user
 
-    def run(self, goal: str, persist_memory: str = None,
-            persist_consolidation: str = None) -> dict:
+    def run(self, goal: str, persist_memory: str = None) -> dict:
         """
-        Run the MemAgent loop.
+        Run the MemAgent loop with four-layer memory.
 
         Args:
-            goal: Task description (e.g., "mine 10 dirt blocks")
-            persist_memory: Optional filepath to load/save semantic memory JSON
-            persist_consolidation: Optional filepath to append consolidation event log JSON
+            goal: Task description (e.g., "craft an iron pickaxe")
+            persist_memory: Optional directory prefix to save memory JSON for debugging.
+            persist_consolidation: Unused (kept for call-site compatibility).
         """
         logger.info(f"[MemAgent] Starting task: {goal}")
         self.wait_for_bot()
         self.reset_inventory()
         self.observer.reset()
-        self.step_memory.clear()
+        self.procedural_memory.clear()
+        self.episodic_memory.clear()
 
         # Snapshot current inventory so LLM only sees items gained this session
         baseline_obs = self.get_observation()
         self.observer.set_baseline_inventory(baseline_obs)
-
-        # Load persisted semantic memory if available
-        if persist_memory:
-            self.semantic_memory.load(persist_memory)
-            logger.info(
-                f"Loaded {len(self.semantic_memory)} semantic rules from {persist_memory}"
-            )
 
         results = {
             "agent_type": "memagent",
@@ -609,40 +690,49 @@ class MemAgent(BaseAgent):
             "consolidation_events": [],
         }
 
+        last_result_msg = ""
+
         for step in range(self.max_steps):
-            # ── Observe (delta encoded) ──
+            # ── Layer 1: Working Memory — observe current state ──
             raw_obs = self.get_observation()
             if step == 0:
-                obs_text = self.observer.observe_full(raw_obs)
+                obs_text = self.observer.observe_full(raw_obs, goal=goal)
             else:
-                obs_text = self.observer.observe_delta(raw_obs)
+                obs_text = self.observer.observe_delta(raw_obs, goal=goal)
 
-            # ── BM25 Retrieval ──
+            # ── BM25 Retrieval from Layers 2, 3, 4 ──
             query_terms = build_query_terms(
                 goal=goal,
                 inventory_terms=self.observer.get_inventory_terms(raw_obs),
-                entity_terms=self.observer.get_entity_terms(raw_obs)
+                entity_terms=self.observer.get_entity_terms(raw_obs),
             )
 
-            # Retrieve from step memory
-            step_results = self.retriever.retrieve(
-                query_terms, self.step_memory.get_all(),
-                top_k=self.retrieval_top_k
+            # Layer 2: Procedural Memory — retrieve relevant skills
+            proc_results = self.retriever.retrieve(
+                query_terms, self.procedural_memory.get_all(),
+                top_k=self.retrieval_top_k,
             )
-            retrieved_text = ""
-            if step_results:
-                lines = [f"  - {e['text']}" for e, score in step_results if score > 0]
-                if lines:
-                    retrieved_text = "\n".join(lines)
+            procedures_text = "\n".join(
+                f"  - {e['text']}" for e, score in proc_results if score > 0
+            )
 
-            # Always show all semantic rules so LLM has full memory context
-            rules_text = self.semantic_memory.get_rules_text() if len(self.semantic_memory) > 0 else ""
+            # Layer 3: Episodic Memory — retrieve relevant lessons
+            ep_results = self.retriever.retrieve(
+                query_terms, self.episodic_memory.get_all(),
+                top_k=self.retrieval_top_k,
+            )
+            episodes_text = "\n".join(
+                f"  - {e['text']}" for e, score in ep_results if score > 0
+            )
+
+            logger.info(f"  Observation: {obs_text}")
 
             # ── Think (LLM call) ──
             system, user = self.build_prompt(
                 goal, obs_text,
-                retrieved_memories=retrieved_text,
-                semantic_rules=rules_text
+                procedures=procedures_text,
+                episodes=episodes_text,
+                last_result=last_result_msg,
             )
             response = self.brain.query(system, user)
 
@@ -686,58 +776,63 @@ class MemAgent(BaseAgent):
                 action_params = {"steps": 5}
                 self._consecutive_fails = 0
 
+            # Hard guard: avoid repeatedly failing the same action pattern
+            forced_name, forced_params = self.maybe_override_repeated_failure(
+                action_name, action_params
+            )
+            if forced_name != action_name or forced_params != action_params:
+                logger.warning(
+                    f"Step {step}: Repeated failures on {action_name}({action_params}) - "
+                    f"forcing {forced_name}({forced_params})"
+                )
+                action_name, action_params = forced_name, forced_params
+
             result = self.execute_action(action_name, action_params)
             success = result.get("success", False)
-            self.track_action_result(action_name, action_params, success)
-
-            # ── Store in step memory ──
-            self.step_memory.add(
-                action=f"{action_name}({json.dumps(action_params)})",
-                observation=obs_text,
-                result=result.get("message", ""),
-                success=success
-            )
+            result_msg = result.get("message", "")
+            self.track_action_result(action_name, action_params, success, result_msg)
+            last_result_msg = f"{'✓' if success else '✗'} {action_name}({action_params}): {result_msg}"
 
             logger.info(
                 f"Step {step}: {action_name}({action_params}) → "
-                f"{'✓' if success else '✗'} {result.get('message', '')}"
+                f"{'✓' if success else '✗'} {result_msg}"
             )
 
             results["steps"].append({
                 "step": step,
                 "action": action_name,
                 "params": action_params,
-                "result": result.get("message", ""),
+                "result": result_msg,
                 "success": success,
                 "tokens": response["tokens_used"],
             })
 
-            # ── Agentic memory update (after every action, including the final one) ──
-            mem_summary = self.consolidator.update_after_action(
-                action_name=action_name,
-                action_params=action_params,
-                action_result=result.get("message", ""),
-                action_success=success,
-                step_memory=self.step_memory,
-                semantic_memory=self.semantic_memory,
-                goal=goal,
-            )
-            if mem_summary["inserted"] or mem_summary["updated"] or mem_summary["deleted"]:
-                logger.info(
-                    f"Step {step}: Memory ops — "
-                    f"inserted={mem_summary['inserted']} "
-                    f"updated={mem_summary['updated']} "
-                    f"deleted={mem_summary['deleted']}"
+            # ── Consolidation: update the three persistent memory layers ──
+
+            # Layer 3: Reflect on failure → EpisodicMemory
+            if not success:
+                stored = self.consolidator.reflect_on_failure(
+                    action_name=action_name,
+                    action_params=action_params,
+                    action_result=result_msg,
+                    goal=goal,
+                    episodic_memory=self.episodic_memory,
                 )
-                if mem_summary.get("new_rules"):
-                    logger.info(f"  New rules: {mem_summary['new_rules']}")
-                results["consolidation_events"].append({
-                    "step": step,
-                    "inserted": mem_summary["inserted"],
-                    "updated": mem_summary["updated"],
-                    "deleted": mem_summary["deleted"],
-                    "new_rules": mem_summary.get("new_rules", []),
-                })
+                if stored:
+                    logger.info(f"Step {step}: Lesson stored in EpisodicMemory")
+                    results["consolidation_events"].append(
+                        {"step": step, "type": "episodic", "action": action_name}
+                    )
+
+            # Layer 2: Extract skills every N steps
+            if (step + 1) % self.skill_extract_every == 0:
+                n = self.consolidator.extract_skills(
+                    recent_steps=results["steps"],
+                    goal=goal,
+                    procedural_memory=self.procedural_memory,
+                )
+                if n:
+                    logger.info(f"Step {step}: Extracted {n} skill(s) into ProceduralMemory")
 
             # Programmatic goal check
             post_obs = self.get_observation()
@@ -748,34 +843,18 @@ class MemAgent(BaseAgent):
 
             time.sleep(0.5)
 
-        # ── Save semantic memory ──
+        # ── Save memory for debugging ──
         if persist_memory:
-            self.semantic_memory.save(persist_memory)
-            logger.info(f"Saved {len(self.semantic_memory)} rules to {persist_memory}")
-
-        # ── Append consolidation event log ──
-        if persist_consolidation and results["consolidation_events"]:
-            existing = []
-            try:
-                with open(persist_consolidation, "r") as f:
-                    existing = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                pass
-            existing.append({
-                "goal": goal,
-                "timestamp": time.time(),
-                "success": results["success"],
-                "total_steps": len(results["steps"]),
-                "events": results["consolidation_events"],
-            })
-            with open(persist_consolidation, "w") as f:
-                json.dump(existing, f, indent=2)
-            logger.info(
-                f"Appended {len(results['consolidation_events'])} consolidation events "
-                f"to {persist_consolidation}"
-            )
+            import os
+            base = os.path.dirname(persist_memory)
+            os.makedirs(base, exist_ok=True)
+            self.procedural_memory.save(
+                os.path.join(base, "procedural.json"))
+            self.episodic_memory.save(
+                os.path.join(base, "episodic.json"))
 
         results["total_steps"] = len(results["steps"])
         results["brain_stats"] = self.brain.get_stats()
-        results["semantic_rules"] = [r["text"] for r in self.semantic_memory.get_all()]
+        results["procedural_skills"] = [s["skill_name"] for s in self.procedural_memory.skills]
+        results["episodic_lessons"] = len(self.episodic_memory)
         return results

@@ -188,7 +188,7 @@ app.post('/action', async (req, res) => {
         lastError = null;
         const result = await Promise.race([
             actions[name](params || {}),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Action timeout (45s)')), 45000))
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Action timeout (90s)')), 90000))
         ]);
         res.json(result);
     } catch (e) {

@@ -1,8 +1,8 @@
 from .agent import MemAgent, NoMemoryAgent, NaiveMemoryAgent
 from .brain import Brain
-from .memory import StepMemory, SemanticMemory
+from .memory import FifoHistory, ProceduralMemory, EpisodicMemory
 
 __all__ = [
     'MemAgent', 'NoMemoryAgent', 'NaiveMemoryAgent',
-    'Brain', 'StepMemory', 'SemanticMemory'
+    'Brain', 'FifoHistory', 'ProceduralMemory', 'EpisodicMemory',
 ]

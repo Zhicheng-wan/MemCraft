@@ -1,160 +1,154 @@
 """
-consolidation.py - Agentic Per-Step Memory Update
+consolidation.py - Event-driven memory consolidation for the three-layer system.
 
-Flow:
-  - Before each action: LLM reads all semantic memories (handled in agent.py)
-  - After each action:  LLM sees the action result + current memory and
-                        decides which memory operations to apply:
+Two consolidation triggers:
 
-    [
-      {"op": "insert", "text": "new rule", "confidence": 0.9},
-      {"op": "update", "id": "abc123", "text": "revised rule", "confidence": 0.95},
-      {"op": "delete", "id": "def456"}
-    ]
+1. reflect_on_failure()  — called after every failed action
+   LLM writes ONE actionable lesson → EpisodicMemory.
+
+2. extract_skills()      — called every N steps
+   LLM extracts reusable procedures from recent successes → ProceduralMemory.
 """
 
-from .memory import StepMemory, SemanticMemory
+import json
+import logging
+from .memory import ProceduralMemory, EpisodicMemory
 
-_SYSTEM_PROMPT = (
-    "You are a Minecraft gameplay analyst managing a structured memory of learned rules.\n\n"
-    "You will receive:\n"
-    "  1. The goal the agent is trying to achieve\n"
-    "  2. The action just executed and its result (success or failure)\n"
-    "  3. Recent action history for context\n"
-    "  4. Current memory rules, each with a unique ID in brackets\n\n"
-    "Decide how to update the memory. Output ONLY a JSON array of operations:\n"
-    '  {"op": "insert", "text": "<new rule>", "confidence": <0.0-1.0>}\n'
-    '  {"op": "update", "id": "<rule_id>", "text": "<revised rule>", "confidence": <0.0-1.0>}\n'
-    '  {"op": "delete", "id": "<rule_id>"}\n\n'
+logger = logging.getLogger("memcraft")
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
+_REFLECT_SYSTEM_PROMPT = (
+    "You are helping a Minecraft agent learn from failures.\n\n"
+    "The agent just failed to execute an action. Write ONE concrete, "
+    "actionable lesson so the agent avoids this mistake in the future.\n\n"
+    "Output ONLY a JSON object:\n"
+    '  {"lesson": "<one-sentence lesson>", "context": "<brief failure context>"}\n\n'
     "Guidelines:\n"
-    "- INSERT when this result reveals new actionable knowledge not already in memory.\n"
-    "- UPDATE when this result shows an existing rule is incomplete or needs correction.\n"
-    "- DELETE when this result proves an existing rule is wrong or misleading.\n"
-    "- Most steps will need no change — output [] if nothing meaningful was learned.\n"
-    "- Rules must be SPECIFIC (exact item names, counts, action sequences).\n"
-    "- Never insert a rule already covered by an existing one.\n"
+    "- The lesson MUST say BOTH what went wrong AND the exact next action to take.\n"
+    "- CRITICAL: The lesson MUST keep the agent on track toward its current goal. "
+    "NEVER suggest abandoning the current goal step or retreating to easier actions like mining wood.\n"
+    "- BAD:  'stone mining failed' (no next action specified)\n"
+    "- BAD:  'mine wood logs instead' (retreats from goal)\n"
+    "- GOOD: 'stone items fell into holes — immediately use collect_nearby_items to recover drops, then retry find_and_mine_block(stone) at a different spot'\n"
+    "- GOOD: 'crafting table placement failed here — use move_forward(steps=3) to find flat ground, then retry craft_item'\n"
+    "- GOOD: 'move_to timed out — use move_forward(steps=3) instead for short-distance navigation'\n"
+    "- If items were lost to terrain: next step is collect_nearby_items, NOT switching to a different resource.\n"
+    "- If placement failed: next step is move_forward to find flat ground, NOT changing goals.\n"
+    "- If a resource is missing: name the exact item and the action to obtain it.\n"
+    "- If wrong tool tier: name the required tier and how to craft it.\n"
+    "- Output ONLY valid JSON. No explanations."
+)
+
+_SKILL_SYSTEM_PROMPT = (
+    "You are helping a Minecraft agent build a procedural skill library.\n\n"
+    "You will receive the agent's recent successful actions toward a goal. "
+    "Extract complete, reusable named skills from these sequences.\n\n"
+    "Output ONLY a JSON array:\n"
+    '  [{"skill_name": "<verb_noun>", "description": "<steps and prerequisites>"}]\n\n'
+    "Guidelines:\n"
+    "- Only extract COMPLETE procedures (e.g. craft_wooden_pickaxe, smelt_raw_iron).\n"
+    "- Include ALL prerequisites in the description "
+    "(e.g. 'requires 4 oak_log: mine logs → craft planks → craft sticks → craft pickaxe').\n"
+    "- Output [] if no complete reusable skill is apparent.\n"
     "- Output ONLY valid JSON. No explanations."
 )
 
 
-def _apply_and_summarize(semantic_memory: SemanticMemory, parsed: list) -> dict:
-    """Apply parsed operations and return a summary with new rule texts."""
-    ids_before = {r["id"] for r in semantic_memory.get_all()}
-    summary = semantic_memory.apply_operations(parsed)
-    ids_after = {r["id"] for r in semantic_memory.get_all()}
-
-    new_ids = ids_after - ids_before
-    summary["new_rules"] = [
-        r["text"] for r in semantic_memory.get_all() if r["id"] in new_ids
-    ]
-    return summary
-
-
-def _empty_summary() -> dict:
-    return {"inserted": 0, "updated": 0, "deleted": 0, "skipped": 0, "new_rules": []}
-
+# ---------------------------------------------------------------------------
+# Consolidator
+# ---------------------------------------------------------------------------
 
 class Consolidator:
     """
-    Per-step agentic memory updater.
+    Event-driven memory consolidator for the four-layer memory architecture.
 
-    After every action the agent calls `update_after_action()`.
-    The LLM decides which INSERT / UPDATE / DELETE operations to apply
-    based on the just-executed action and its result.
+    reflect_on_failure() → EpisodicMemory   (1 LLM call per failure)
+    extract_skills()     → ProceduralMemory  (1 LLM call every N steps)
+    update_spatial()     → SpatialMemory     (heuristic, no LLM call)
     """
 
-    def __init__(self, brain, evidence_window: int = 5):
-        """
-        Args:
-            brain:           Brain instance for LLM calls
-            evidence_window: Number of recent steps shown as context
-        """
+    def __init__(self, brain, skill_extraction_window: int = 5):
         self.brain = brain
-        self.evidence_window = evidence_window
+        self.skill_extraction_window = skill_extraction_window
 
-    def update_after_action(
+    def reflect_on_failure(
         self,
         action_name: str,
         action_params: dict,
         action_result: str,
-        action_success: bool,
-        step_memory: StepMemory,
-        semantic_memory: SemanticMemory,
         goal: str,
-    ) -> dict:
+        episodic_memory: EpisodicMemory,
+    ) -> bool:
         """
-        Called after every action. The LLM reviews:
-          - The action just executed + result
-          - Recent history for context
-          - Current semantic memory
-
-        Returns a summary dict: {inserted, updated, deleted, skipped, new_rules}
+        Called after a failed action.
+        LLM reflects on the failure and stores one lesson in EpisodicMemory.
+        Returns True if a lesson was stored.
         """
-        import json
+        user_prompt = (
+            f"Goal: {goal}\n"
+            f"Failed action: {action_name}({json.dumps(action_params)})\n"
+            f"Failure message: {action_result}\n\n"
+            "What lesson should the agent remember to avoid this mistake?\n"
+            "Output a JSON object with 'lesson' and 'context' fields:"
+        )
+        result = self.brain.query(_REFLECT_SYSTEM_PROMPT, user_prompt)
+        if result["error"]:
+            return False
 
-        recent = step_memory.get_recent(self.evidence_window)
-        history_text = "\n".join(
-            f"  {'OK' if e['success'] else 'FAIL'} {e['action']} -> {e['result']}"
-            for e in recent
-        ) or "  (no history yet)"
+        parsed = self.brain.parse_json_response(result["content"])
+        if not isinstance(parsed, dict):
+            return False
 
-        existing_rules = semantic_memory.get_rules_for_prompt()
+        lesson = parsed.get("lesson", "").strip()
+        context = parsed.get("context", action_name).strip()
+        if lesson:
+            episodic_memory.add_lesson(context, lesson)
+            logger.info(f"  Lesson: {lesson}")
+            return True
+        return False
 
+    def extract_skills(
+        self,
+        recent_steps: list,
+        goal: str,
+        procedural_memory: ProceduralMemory,
+    ) -> int:
+        """
+        Called every N steps.
+        LLM extracts reusable skills from recent successful steps.
+        Returns the number of skills added or updated.
+        """
+        successful = [s for s in recent_steps if s.get("success")]
+        if len(successful) < 2:
+            return 0
+
+        steps_text = "\n".join(
+            f"  + {s['action']}({json.dumps(s.get('params', {}))}) -> {s['result']}"
+            for s in successful[-self.skill_extraction_window:]
+        )
         user_prompt = (
             f"Goal: {goal}\n\n"
-            f"Action just executed: {action_name}({json.dumps(action_params)})\n"
-            f"Result: {'SUCCESS' if action_success else 'FAILURE'} — {action_result}\n\n"
-            f"Recent history (last {len(recent)} steps):\n{history_text}\n\n"
-            f"Current memory rules (use IDs for UPDATE/DELETE):\n{existing_rules}\n\n"
-            "What memory operations should be applied? Output a JSON array of operations:"
+            f"Recent successful steps:\n{steps_text}\n\n"
+            "Extract reusable skills as a JSON array:"
         )
-
-        result = self.brain.query(_SYSTEM_PROMPT, user_prompt)
+        result = self.brain.query(_SKILL_SYSTEM_PROMPT, user_prompt)
         if result["error"]:
-            return _empty_summary()
+            return 0
 
         parsed = self.brain.parse_json_response(result["content"])
         if not isinstance(parsed, list):
-            return _empty_summary()
+            return 0
 
-        return _apply_and_summarize(semantic_memory, parsed)
+        count = 0
+        for skill in parsed:
+            if isinstance(skill, dict):
+                name = skill.get("skill_name", "").strip()
+                desc = skill.get("description", "").strip()
+                if name and desc:
+                    procedural_memory.add_skill(name, desc)
+                    count += 1
+        return count
 
-    # ------------------------------------------------------------------
-    # Legacy batch consolidation (kept for episode-end summary if needed)
-    # ------------------------------------------------------------------
-
-    def consolidate(self, step_memory: StepMemory,
-                    semantic_memory: SemanticMemory,
-                    goal: str) -> dict:
-        """
-        Batch consolidation over recent N steps.
-        Can be called at episode end for a final memory pass.
-        """
-        recent = step_memory.get_recent(self.evidence_window * 2)
-        if len(recent) < 3:
-            return _empty_summary()
-
-        history_text = "\n".join(
-            f"  Step {e['step']}: {'OK' if e['success'] else 'FAIL'} "
-            f"{e['action']} -> {e['result']}"
-            for e in recent
-        )
-        existing_rules = semantic_memory.get_rules_for_prompt()
-
-        user_prompt = (
-            f"Goal: {goal}\n\n"
-            f"Recent history ({len(recent)} steps):\n{history_text}\n\n"
-            f"Current memory rules (use IDs for UPDATE/DELETE):\n{existing_rules}\n\n"
-            "Review the full history and decide what memory operations to apply. "
-            "Output a JSON array of operations:"
-        )
-
-        result = self.brain.query(_SYSTEM_PROMPT, user_prompt)
-        if result["error"]:
-            return _empty_summary()
-
-        parsed = self.brain.parse_json_response(result["content"])
-        if not isinstance(parsed, list):
-            return _empty_summary()
-
-        return _apply_and_summarize(semantic_memory, parsed)

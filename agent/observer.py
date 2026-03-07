@@ -8,6 +8,60 @@ This dramatically reduces token usage per step.
 import json
 from typing import Optional
 
+# Benchmark-relevant recipes: item → {material: qty_needed}
+# Quantities are the minimum needed for one craft.
+_CRAFTABLE_RECIPES = {
+    "oak_planks":     {"oak_log": 1},
+    "birch_planks":   {"birch_log": 1},
+    "stick":          {"oak_planks": 2},
+    "crafting_table": {"oak_planks": 4},
+    "wooden_pickaxe": {"oak_planks": 3, "stick": 2},
+    "stone_pickaxe":  {"cobblestone": 3, "stick": 2},
+    "furnace":        {"cobblestone": 8},
+    "iron_pickaxe":   {"iron_ingot": 3, "stick": 2},
+}
+
+# Tool prerequisites: to gather the primary material, you need this tool first.
+_TOOL_PREREQUISITES = {
+    "stone_pickaxe": "wooden_pickaxe",   # need wooden_pickaxe to mine cobblestone
+    "iron_pickaxe":  "stone_pickaxe",    # need stone_pickaxe to mine iron ore
+}
+
+def _check_craftable(inv: dict) -> list:
+    """Return list of items craftable from the given inventory."""
+    return [
+        item for item, needed in _CRAFTABLE_RECIPES.items()
+        if all(inv.get(mat, 0) >= qty for mat, qty in needed.items())
+    ]
+
+def _missing_for_goal(inv: dict, goal: str) -> str:
+    """Return missing materials for the goal item, or empty string if goal item not in recipes."""
+    goal_lower = goal.lower()
+    target = next(
+        (item for item in _CRAFTABLE_RECIPES if item in goal_lower),
+        None
+    )
+    if target is None:
+        return ""
+
+    # Check tool prerequisite first — must have the right tool before gathering materials
+    prereq_tool = _TOOL_PREREQUISITES.get(target)
+    if prereq_tool and inv.get(prereq_tool, 0) < 1:
+        prereq_recipe = _CRAFTABLE_RECIPES.get(prereq_tool, {})
+        prereq_missing = {mat: qty - inv.get(mat, 0) for mat, qty in prereq_recipe.items() if inv.get(mat, 0) < qty}
+        if prereq_missing:
+            parts = ", ".join(f"{mat} x{qty}" for mat, qty in prereq_missing.items())
+            return f"Step 1: craft {prereq_tool} first. Missing: {parts}"
+        else:
+            return f"READY TO CRAFT: {prereq_tool} (needed before mining for {target})"
+
+    needed = _CRAFTABLE_RECIPES[target]
+    missing = {mat: qty - inv.get(mat, 0) for mat, qty in needed.items() if inv.get(mat, 0) < qty}
+    if not missing:
+        return f"READY TO CRAFT: {target}"
+    parts = ", ".join(f"{mat} x{qty}" for mat, qty in missing.items())
+    return f"Missing for {target}: {parts}"
+
 
 class Observer:
     """Converts raw observations into compact text, with delta encoding."""
@@ -39,7 +93,7 @@ class Observer:
                 session_inv[item] = gained
         return session_inv
 
-    def observe_full(self, raw_obs: dict) -> str:
+    def observe_full(self, raw_obs: dict, goal: str = "") -> str:
         """Convert raw observation to full text representation."""
         parts = []
 
@@ -64,6 +118,15 @@ class Observer:
         else:
             parts.append("Inventory (this session): [empty]")
 
+        # Craftable items + goal progress
+        craftable = _check_craftable(inv)
+        if craftable:
+            parts.append(f"Craftable now: {', '.join(craftable)}")
+        if goal:
+            missing = _missing_for_goal(inv, goal)
+            if missing:
+                parts.append(missing)
+
         # Equipment
         eq = raw_obs.get("equipment", {})
         hand = eq.get("mainhand", "empty")
@@ -83,9 +146,9 @@ class Observer:
             ent_strs = [f"{e['type']}(d={e['distance']})" for e in entities[:5]]
             parts.append(f"Nearby: {', '.join(ent_strs)}")
 
-        # Nearby blocks (top 8, skip common ones)
+        # Nearby blocks (top 8, skip truly common noise)
         blocks = raw_obs.get("nearby_blocks", {})
-        skip_blocks = {"stone", "dirt", "grass_block", "air", "bedrock"}
+        skip_blocks = {"dirt", "grass_block", "air", "bedrock"}
         interesting = {k: v for k, v in blocks.items() if k not in skip_blocks}
         if interesting:
             top = sorted(interesting.items(), key=lambda x: -x[1])[:8]
@@ -98,14 +161,14 @@ class Observer:
 
         return " | ".join(parts)
 
-    def observe_delta(self, raw_obs: dict) -> str:
+    def observe_delta(self, raw_obs: dict, goal: str = "") -> str:
         """
         Compute delta from previous observation.
         Only includes fields that changed.
         """
         if self.prev_observation is None:
             self.prev_observation = raw_obs
-            return self.observe_full(raw_obs)
+            return self.observe_full(raw_obs, goal=goal)
 
         prev = self.prev_observation
         changes = []
@@ -162,6 +225,13 @@ class Observer:
             changes.append(f"⚠ Error: {raw_obs['last_error']}")
 
         self.prev_observation = raw_obs
+
+        # Always show goal progress (even in delta — so agent never forgets what it needs)
+        if goal:
+            inv = self._get_session_inventory(raw_obs)
+            missing = _missing_for_goal(inv, goal)
+            if missing:
+                changes.append(missing)
 
         if not changes:
             return "[No significant changes]"

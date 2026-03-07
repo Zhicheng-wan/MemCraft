@@ -43,12 +43,12 @@ TASK_COUNT=${#TASKS[@]}
 
 # ── 解析参数 ──────────────────────────────────────────────────────────────
 FROM=16
-TO=20
+TO=16
 SINGLE=""
 EPISODES=1
 MAX_STEPS_OVERRIDE=""
-MODEL="api-llama-4-scout"
-EXTRA_FLAGS=""
+MODEL="api-gpt-oss-120b"
+#EXTRA_FLAGS="--no-recipes"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -103,7 +103,7 @@ echo "=========================================="
 
 # Kill any existing bridge
 pkill -f "node bot.js" 2>/dev/null
-fuser -k 3001/tcp 2>/dev/null
+lsof -ti:3001 | xargs kill -9 2>/dev/null
 sleep 2
 
 TOTAL_PASS=0
@@ -122,29 +122,60 @@ for ((i = FROM; i <= TO; i++)); do
     echo "  $task  (max ${MAX_STEPS} steps)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # 每个任务使用独立的记忆文件（保留历史，方便对比）
-    MEMORY_FILE="memories/task_${i}_semantic.json"
-    if [ ! -f "$MEMORY_FILE" ]; then
-        echo '[]' > "$MEMORY_FILE"
-    fi
+    TASK_PASS=0
+    TASK_FAIL=0
+    EP_RESULTS=()   # "✓ 22steps 1500tok" per episode
+    RESULT_TMP="/tmp/memagent_ep_result.json"
+    mkdir -p memories/semantic memories/steps
 
-    python run_agent.py \
-        --task "$task" \
-        --agent memagent \
-        --episodes $EPISODES \
-        --port 25565 \
-        --version 1.19.2 \
-        --max-steps $MAX_STEPS \
-        --model "$MODEL" \
-        --memory-file "$MEMORY_FILE" \
-        $EXTRA_FLAGS
+    # 循环 episodes — 每次调用 run_agent.py 都会重置世界
+    for ((ep = 1; ep <= EPISODES; ep++)); do
+        echo "  → Episode ${ep}/${EPISODES}"
 
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -eq 0 ]; then
-        TOTAL_PASS=$((TOTAL_PASS + 1))
-    else
-        TOTAL_FAIL=$((TOTAL_FAIL + 1))
-        FAILED_TASKS+=("$i: $task")
+        python run_agent.py \
+            --task "$task" \
+            --agent memagent \
+            --port 25565 \
+            --version 1.19.2 \
+            --max-steps $MAX_STEPS \
+            --model "$MODEL" \
+            --memory-file "memories/semantic/task_${i}_ep${ep}.json" \
+            --result-file "$RESULT_TMP" \
+            $EXTRA_FLAGS
+
+        EXIT_CODE=$?
+
+        # 读取本 episode 的结果指标
+        if [ -f "$RESULT_TMP" ]; then
+            read EP_SUCCESS EP_STEPS EP_TOKENS EP_ASR < <(python3 -c "
+import json
+r = json.load(open('$RESULT_TMP'))
+print(r['success'], r['total_steps'], r['tokens'], r['action_success_rate'])
+")
+            if [ "$EP_SUCCESS" = "True" ]; then
+                EP_TAG="✓"
+                TASK_PASS=$((TASK_PASS + 1))
+            else
+                EP_TAG="✗"
+                TASK_FAIL=$((TASK_FAIL + 1))
+            fi
+            EP_RESULTS+=("ep${ep}: ${EP_TAG} steps=${EP_STEPS} tokens=${EP_TOKENS} asr=${EP_ASR}")
+        else
+            EP_RESULTS+=("ep${ep}: (no result)")
+            TASK_FAIL=$((TASK_FAIL + 1))
+        fi
+    done
+
+    # Learning curve 展示
+    echo "  ── Learning Curve ──"
+    for line in "${EP_RESULTS[@]}"; do
+        echo "    $line"
+    done
+    echo "  任务 ${i} 完成: ${TASK_PASS}/${EPISODES} 成功"
+    TOTAL_PASS=$((TOTAL_PASS + TASK_PASS))
+    TOTAL_FAIL=$((TOTAL_FAIL + TASK_FAIL))
+    if [ $TASK_FAIL -gt 0 ]; then
+        FAILED_TASKS+=("$i: $task (${TASK_FAIL}/${EPISODES} failed)")
     fi
 done
 
