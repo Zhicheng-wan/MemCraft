@@ -13,7 +13,7 @@ class Brain:
     """LLM interface that handles API calls and token tracking."""
 
     def __init__(self, api_key: str, api_url: str, model: str,
-                 max_tokens: int = 2048, temperature: float = 0.3):
+                 max_tokens: int = 4096, temperature: float = 0.3):
         self.api_key = api_key
         self.api_url = api_url
         self.model = model

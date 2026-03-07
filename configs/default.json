@@ -2,7 +2,7 @@
     "llm": {
         "api_url": "https://tritonai-api.ucsd.edu/v1/chat/completions",
         "model": "api-llama-4-scout",
-        "max_tokens": 512,
+        "max_tokens": 4096,
         "temperature": 0.3
     },
     "memory": {

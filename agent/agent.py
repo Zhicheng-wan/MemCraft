@@ -22,7 +22,8 @@ logger = logging.getLogger("memcraft")
 
 # --- Available actions description for the LLM ---
 ACTIONS_SCHEMA_BASE = """
-You are a Minecraft bot. Respond with ONLY a JSON action object, no other text.
+You are a Minecraft bot. Your ENTIRE response must be a single valid JSON object.
+CRITICAL: No explanations, no markdown, no text before or after the JSON. Just JSON.
 
 == ACTIONS ==
 
@@ -265,7 +266,7 @@ class NoMemoryAgent(BaseAgent):
         system = (
             "You are a Minecraft bot. You are given a goal and the current "
             "game state. Choose ONE action to take next.\n"
-            "Respond with ONLY a JSON action object.\n\n"
+            "Your ENTIRE response must be valid JSON. No other text.\n\n"
             f"{ACTIONS_SCHEMA}"
         )
         failure_warning = self.get_failure_warning()
@@ -392,7 +393,7 @@ class NaiveMemoryAgent(BaseAgent):
         system = (
             "You are a Minecraft bot. You are given a goal, your recent "
             "action history, and the current game state. Choose ONE action.\n"
-            "Respond with ONLY a JSON action object.\n\n"
+            "Your ENTIRE response must be valid JSON. No other text.\n\n"
             f"{ACTIONS_SCHEMA}"
         )
         failure_warning = self.get_failure_warning()
@@ -537,6 +538,8 @@ class MemAgent(BaseAgent):
             evidence_window=mem_cfg.get("consolidation_evidence_window", 5),
         )
         self.retrieval_top_k = mem_cfg.get("retrieval_top_k", 5)
+        self._last_consolidation_step = -1
+        self._consolidation_cooldown = mem_cfg.get("consolidation_cooldown", 3)  # Min steps between consolidations
 
     def build_prompt(self, goal: str, observation: str,
                      retrieved_memories: str = "",
@@ -549,7 +552,7 @@ class MemAgent(BaseAgent):
             "PRIORITIES: Mine and craft immediately. Do NOT waste steps on "
             "scan_surroundings or move_to unless mining has failed 2+ times. "
             "Follow the recipe chain step by step.\n"
-            "Respond with ONLY a JSON action object.\n\n"
+            "Your ENTIRE response must be valid JSON. No explanations, no markdown.\n\n"
             f"{ACTIONS_SCHEMA}"
         )
 
@@ -712,16 +715,21 @@ class MemAgent(BaseAgent):
                 "tokens": response["tokens_used"],
             })
 
-            # ── Agentic memory update (after every action, including the final one) ──
-            mem_summary = self.consolidator.update_after_action(
-                action_name=action_name,
-                action_params=action_params,
-                action_result=result.get("message", ""),
-                action_success=success,
-                step_memory=self.step_memory,
-                semantic_memory=self.semantic_memory,
-                goal=goal,
-            )
+            # ── Agentic memory update (with cooldown to avoid token waste) ──
+            steps_since_last = step - self._last_consolidation_step
+            if steps_since_last >= self._consolidation_cooldown:
+                mem_summary = self.consolidator.update_after_action(
+                    action_name=action_name,
+                    action_params=action_params,
+                    action_result=result.get("message", ""),
+                    action_success=success,
+                    step_memory=self.step_memory,
+                    semantic_memory=self.semantic_memory,
+                    goal=goal,
+                )
+                self._last_consolidation_step = step
+            else:
+                mem_summary = {"inserted": 0, "updated": 0, "deleted": 0, "new_rules": []}
             if mem_summary["inserted"] or mem_summary["updated"] or mem_summary["deleted"]:
                 logger.info(
                     f"Step {step}: Memory ops — "
@@ -747,6 +755,11 @@ class MemAgent(BaseAgent):
                 break
 
             time.sleep(0.5)
+
+        # ── End-of-episode memory maintenance (decay + prune) ──
+        if hasattr(self.semantic_memory, 'end_of_episode'):
+            ep_stats = self.semantic_memory.end_of_episode()
+            logger.info(f"Memory maintenance: {ep_stats}")
 
         # ── Save semantic memory ──
         if persist_memory:

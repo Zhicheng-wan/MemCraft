@@ -39,25 +39,25 @@ def reset_minecraft_world(container=MINECRAFT_CONTAINER, seed=MINECRAFT_SEED, wa
     try:
         # Set seed
         subprocess.run(
-            ["sudo", "docker", "exec", container, "sh", "-c",
+            ["docker", "exec", container, "sh", "-c",
              f'sed -i "s/level-seed=.*/level-seed={seed}/" /data/server.properties'],
             check=True, capture_output=True, timeout=10
         )
         # Set peaceful difficulty (no hostile mobs)
         subprocess.run(
-            ["sudo", "docker", "exec", container, "sh", "-c",
+            ["docker", "exec", container, "sh", "-c",
              'sed -i "s/difficulty=.*/difficulty=peaceful/" /data/server.properties'],
             check=True, capture_output=True, timeout=10
         )
         # Delete world
         subprocess.run(
-            ["sudo", "docker", "exec", container, "rm", "-rf",
+            ["docker", "exec", container, "rm", "-rf",
              "/data/world", "/data/world_nether", "/data/world_the_end"],
             check=True, capture_output=True, timeout=10
         )
         # Restart server
         subprocess.run(
-            ["sudo", "docker", "restart", container],
+            ["docker", "restart", container],
             check=True, capture_output=True, timeout=30
         )
         # Wait for world generation
@@ -315,7 +315,7 @@ def main():
                         api_key=api_key,
                         api_url=api_url,
                         model=args.model,
-                        max_tokens=config.get("llm", {}).get("max_tokens", 512),
+                        max_tokens=config.get("llm", {}).get("max_tokens", 4096),
                         temperature=config.get("llm", {}).get("temperature", 0.3),
                     )
 
@@ -386,7 +386,7 @@ def main():
                 api_key=api_key,
                 api_url=api_url,
                 model=args.model,
-                max_tokens=config.get("llm", {}).get("max_tokens", 512),
+                max_tokens=config.get("llm", {}).get("max_tokens", 4096),
                 temperature=config.get("llm", {}).get("temperature", 0.3),
             )
             results = run_single_agent(
