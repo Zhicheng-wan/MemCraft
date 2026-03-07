@@ -96,7 +96,7 @@ function setupActions(bot, mcData) {
 
     actions.move_to = async ({ x, y, z }) => {
         try {
-            await bot.pathfinder.goto(new GoalNear(x, y, z, 1));
+            await gotoWithTimeout(new GoalNear(x, y, z, 1), 10000);
             return { success: true, message: `Moved to (${x}, ${y}, ${z})` };
         } catch (e) {
             return { success: false, message: `Failed to move: ${e.message}` };
@@ -166,6 +166,19 @@ function setupActions(bot, mcData) {
         }
     };
 
+    /**
+     * Wrapper: pathfinder.goto() with a per-call timeout so a single stuck
+     * path-find never blocks the whole action.
+     */
+    async function gotoWithTimeout(goal, timeoutMs = 8000) {
+        await Promise.race([
+            bot.pathfinder.goto(goal),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(`pathfinder timeout (${timeoutMs}ms)`)), timeoutMs)
+            ),
+        ]);
+    }
+
     actions.find_and_mine_block = async ({ block_name, count = 1 }) => {
         try {
             // Block name aliases: map what agent asks for -> what block exists in world
@@ -209,7 +222,6 @@ function setupActions(bot, mcData) {
                               'spruce_planks', 'crafting_table'];
 
             if (needsPickaxe.includes(actualBlock)) {
-                // Pick the best pickaxe available
                 const pickPriority = ['diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe'];
                 for (const pickName of pickPriority) {
                     const pick = bot.inventory.items().find(i => i.name === pickName);
@@ -241,9 +253,11 @@ function setupActions(bot, mcData) {
                 const targetPos = block.position.clone();
 
                 try {
-                    await bot.pathfinder.goto(new GoalNear(targetPos.x, targetPos.y, targetPos.z, 3));
+                    // Use per-call timeout to prevent a single stuck path-find from
+                    // consuming the entire 45s action budget.
+                    await gotoWithTimeout(new GoalNear(targetPos.x, targetPos.y, targetPos.z, 3), 8000);
                 } catch (moveErr) {
-                    continue;
+                    continue; // block unreachable — try next candidate
                 }
 
                 const freshBlock = bot.blockAt(targetPos);
@@ -255,21 +269,18 @@ function setupActions(bot, mcData) {
                     await bot.dig(freshBlock);
                     mined++;
 
-                    // Wait for drop + actively collect
-                    await new Promise(r => setTimeout(r, 600));
-                    for (let pickup = 0; pickup < 3; pickup++) {
-                        const nearbyItems = Object.values(bot.entities).filter(
-                            e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 6
-                        );
-                        if (nearbyItems.length === 0) break;
-                        for (const item of nearbyItems.slice(0, 3)) {
-                            try {
-                                await bot.pathfinder.goto(
-                                    new GoalNear(item.position.x, item.position.y, item.position.z, 0)
-                                );
-                            } catch (_) {}
-                        }
-                        await new Promise(r => setTimeout(r, 400));
+                    // Wait a bit longer for drops to settle, then sweep for items.
+                    await new Promise(r => setTimeout(r, 500));
+                    const nearbyItems = Object.values(bot.entities).filter(
+                        e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 15
+                    );
+                    for (const item of nearbyItems.slice(0, 5)) {
+                        try {
+                            await gotoWithTimeout(
+                                new GoalNear(item.position.x, item.position.y, item.position.z, 1),
+                                3000
+                            );
+                        } catch (_) {}
                     }
                     await new Promise(r => setTimeout(r, 300));
                 } catch (digErr) {
@@ -280,6 +291,20 @@ function setupActions(bot, mcData) {
                     };
                 }
             }
+
+            // Final sweep: catch any remaining drops after the full mining loop
+            const finalItems = Object.values(bot.entities).filter(
+                e => e.name === 'item' && e.position.distanceTo(bot.entity.position) < 20
+            );
+            for (const item of finalItems.slice(0, 5)) {
+                try {
+                    await gotoWithTimeout(
+                        new GoalNear(item.position.x, item.position.y, item.position.z, 1),
+                        3000
+                    );
+                } catch (_) {}
+            }
+            await new Promise(r => setTimeout(r, 400));
 
             const gained = countInventoryItem(expectedDrop) - beforeCount;
             if (gained < mined && gained < count) {
@@ -375,8 +400,9 @@ function setupActions(bot, mcData) {
                 }
             }
 
-            await bot.pathfinder.goto(
-                new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3)
+            await gotoWithTimeout(
+                new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3),
+                8000
             );
 
             recipes = bot.recipesFor(item.id, null, 1, craftingTable);
@@ -538,7 +564,7 @@ function setupActions(bot, mcData) {
                     }
 
                     if (craftingTable) {
-                        await bot.pathfinder.goto(new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3));
+                        await gotoWithTimeout(new GoalNear(craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3), 8000);
                         const furnaceItemData = mcData.itemsByName.furnace;
                         const furnaceRecipes = bot.recipesFor(furnaceItemData.id, null, 1, craftingTable);
                         if (furnaceRecipes.length > 0) {
@@ -556,7 +582,7 @@ function setupActions(bot, mcData) {
                 if (!furnaceBlock) return { success: false, message: `Furnace not found after placing` };
             }
 
-            await bot.pathfinder.goto(new GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 3));
+            await gotoWithTimeout(new GoalNear(furnaceBlock.position.x, furnaceBlock.position.y, furnaceBlock.position.z, 3), 8000);
 
             const furnaceEntity = await bot.openFurnace(furnaceBlock);
 
@@ -639,11 +665,16 @@ function setupActions(bot, mcData) {
             let collected = 0;
             for (const item of items.slice(0, 8)) {
                 try {
-                    await bot.pathfinder.goto(new GoalNear(item.position.x, item.position.y, item.position.z, 0));
+                    // GoalNear(1) is sufficient — items auto-pickup within 1 block.
+                    // Per-call timeout prevents a single unreachable item from blocking.
+                    await gotoWithTimeout(
+                        new GoalNear(item.position.x, item.position.y, item.position.z, 1),
+                        4000
+                    );
                     collected++;
                 } catch (_) {}
             }
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 400));
             return { success: true, message: `Walked to ${collected} nearby items` };
         } catch (e) {
             return { success: false, message: `Failed: ${e.message}` };

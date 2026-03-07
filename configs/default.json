@@ -2,15 +2,16 @@
     "llm": {
         "api_url": "https://tritonai-api.ucsd.edu/v1/chat/completions",
         "model": "api-llama-4-scout",
-        "max_tokens": 512,
+        "max_tokens": 2048,
         "temperature": 0.3
     },
     "memory": {
-        "step_memory_capacity": 50,
-        "semantic_memory_capacity": 30,
+        "procedural_memory_capacity": 20,
+        "episodic_memory_capacity": 30,
+        "spatial_memory_capacity": 50,
         "retrieval_top_k": 5,
-        "consolidation_interval": 10,
-        "consolidation_evidence_window": 5
+        "skill_extract_every_n_steps": 10,
+        "skill_extraction_window": 5
     },
     "agent": {
         "max_steps": 100,

@@ -39,25 +39,25 @@ def reset_minecraft_world(container=MINECRAFT_CONTAINER, seed=MINECRAFT_SEED, wa
     try:
         # Set seed
         subprocess.run(
-            ["sudo", "docker", "exec", container, "sh", "-c",
+            ["docker", "exec", container, "sh", "-c",
              f'sed -i "s/level-seed=.*/level-seed={seed}/" /data/server.properties'],
             check=True, capture_output=True, timeout=10
         )
         # Set peaceful difficulty (no hostile mobs)
         subprocess.run(
-            ["sudo", "docker", "exec", container, "sh", "-c",
+            ["docker", "exec", container, "sh", "-c",
              'sed -i "s/difficulty=.*/difficulty=peaceful/" /data/server.properties'],
             check=True, capture_output=True, timeout=10
         )
         # Delete world
         subprocess.run(
-            ["sudo", "docker", "exec", container, "rm", "-rf",
+            ["docker", "exec", container, "rm", "-rf",
              "/data/world", "/data/world_nether", "/data/world_the_end"],
             check=True, capture_output=True, timeout=10
         )
         # Restart server
         subprocess.run(
-            ["sudo", "docker", "restart", container],
+            ["docker", "restart", container],
             check=True, capture_output=True, timeout=30
         )
         # Wait for world generation
@@ -121,7 +121,7 @@ def start_mineflayer_bridge(host: str, port: int, username: str,
 
 def run_single_agent(agent_type: str, brain: Brain, goal: str,
                      bot_url: str, max_steps: int, config: dict,
-                     memory_file: str = "memories/semantic_rules.json") -> dict:
+                     memory_file: str = None) -> dict:
     """Run a single agent variant."""
     if agent_type == "no_memory":
         agent = NoMemoryAgent(brain, bot_url=bot_url, max_steps=max_steps)
@@ -135,13 +135,8 @@ def run_single_agent(agent_type: str, brain: Brain, goal: str,
         raise ValueError(f"Unknown agent type: {agent_type}")
 
     if agent_type == "memagent":
-        consolidation_file = memory_file.replace("_semantic.json", "_consolidation.json")
-        if consolidation_file == memory_file:
-            consolidation_file = memory_file.replace(".json", "_consolidation.json")
-        return agent.run(goal, persist_memory=memory_file,
-                         persist_consolidation=consolidation_file)
-    else:
-        return agent.run(goal)
+        return agent.run(goal, persist_memory=memory_file)
+    return agent.run(goal)
 
 
 def print_results(results: dict):
@@ -206,8 +201,10 @@ def main():
                         help="Disable recipe hints (agents must discover crafting sequences)")
     parser.add_argument("--skip-agents", type=str, default="",
                         help="Comma-separated agents to skip (e.g. no_memory,memagent)")
-    parser.add_argument("--memory-file", type=str, default="memories/semantic_rules.json",
-                        help="Path to semantic memory JSON file for memagent")
+    parser.add_argument("--memory-file", type=str, default=None,
+                        help="Path to save memory JSON for debugging (no cross-episode loading)")
+    parser.add_argument("--result-file", type=str, default="",
+                        help="Write episode result summary JSON to this path (for learning curve tracking)")
 
     args = parser.parse_args()
     setup_logging(args.debug)
@@ -301,7 +298,8 @@ def main():
                         pass
                     time.sleep(3)
 
-                    reset_minecraft_world(wait=90)
+                    if not reset_minecraft_world(wait=90):
+                        raise RuntimeError("World reset failed — aborting episode")
 
                     bridge_proc = start_mineflayer_bridge(
                         args.host, args.port, args.username,
@@ -381,7 +379,34 @@ def main():
             logger.info(f"Comparison saved to logs/comparison_{timestamp}.json")
 
         else:
-            # Run single agent
+            # Run single agent — reset world first for a clean state
+            if bridge_proc:
+                try:
+                    requests.post(f"{bot_url}/disconnect", timeout=3)
+                except:
+                    pass
+                bridge_proc.terminate()
+                try:
+                    bridge_proc.wait(timeout=5)
+                except:
+                    bridge_proc.kill()
+                bridge_proc = None
+
+            try:
+                subprocess.run(["pkill", "-f", "node bot.js"],
+                               capture_output=True, timeout=5)
+            except:
+                pass
+            time.sleep(3)
+
+            if not reset_minecraft_world(wait=90):
+                raise RuntimeError("World reset failed — aborting episode")
+
+            bridge_proc = start_mineflayer_bridge(
+                args.host, args.port, args.username, args.version, args.http_port
+            )
+            time.sleep(20)
+
             brain = Brain(
                 api_key=api_key,
                 api_url=api_url,
@@ -396,12 +421,25 @@ def main():
             )
             print_results(results)
 
-            # Save results
+            # Save full results
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             out_path = f"logs/run_{args.agent}_{timestamp}.json"
             with open(out_path, "w") as f:
                 json.dump(results, f, indent=2, default=str)
             logger.info(f"Results saved to {out_path}")
+
+            # Write compact summary for learning curve tracking
+            if args.result_file:
+                steps = results.get("steps", [])
+                action_successes = sum(1 for s in steps if s.get("success"))
+                summary = {
+                    "success": results["success"],
+                    "total_steps": results["total_steps"],
+                    "tokens": results.get("brain_stats", {}).get("total_tokens", 0),
+                    "action_success_rate": round(action_successes / len(steps), 3) if steps else 0,
+                }
+                with open(args.result_file, "w") as f:
+                    json.dump(summary, f)
 
     finally:
         if bridge_proc:

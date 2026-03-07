@@ -13,7 +13,7 @@ class Brain:
     """LLM interface that handles API calls and token tracking."""
 
     def __init__(self, api_key: str, api_url: str, model: str,
-                 max_tokens: int = 2048, temperature: float = 0.3):
+                 max_tokens: int = 4096, temperature: float = 0.3):
         self.api_key = api_key
         self.api_url = api_url
         self.model = model
@@ -103,28 +103,53 @@ class Brain:
             }
 
     def parse_json_response(self, content: str) -> Optional[dict]:
-        """Try to parse JSON from LLM response, handling markdown fences."""
+        """Try to parse JSON from LLM response, handling markdown fences and thinking blocks."""
         if not content:
             return None
         content = content.strip()
+
+        # Strip <think>...</think> reasoning blocks (Llama-4 / reasoning models)
+        import re
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
         # Strip markdown code fences
         if content.startswith("```"):
             lines = content.split("\n")
-            # Remove first and last lines (fences)
             lines = [l for l in lines if not l.strip().startswith("```")]
-            content = "\n".join(lines)
+            content = "\n".join(lines).strip()
 
         try:
             return json.loads(content)
         except json.JSONDecodeError:
-            # Try to find JSON within the text
-            start = content.find("{")
-            end = content.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(content[start:end])
-                except json.JSONDecodeError:
-                    pass
+            # Find the outermost balanced JSON object or array
+            for open_char, close_char in [('{', '}'), ('[', ']')]:
+                start = content.find(open_char)
+                if start < 0:
+                    continue
+                depth = 0
+                in_string = False
+                escape_next = False
+                for i, ch in enumerate(content[start:], start):
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == '\\' and in_string:
+                        escape_next = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == open_char:
+                        depth += 1
+                    elif ch == close_char:
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                return json.loads(content[start:i + 1])
+                            except json.JSONDecodeError:
+                                break
             return None
 
     def get_stats(self) -> dict:
